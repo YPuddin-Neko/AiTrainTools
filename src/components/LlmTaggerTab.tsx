@@ -4,12 +4,13 @@ import { listen } from '../utils/tauriRuntime';
 import {
   Play, Loader2, Globe, Key, MessageSquare, Bot,
   RefreshCw, Thermometer, Hash, StopCircle, Save, ImageIcon, Timer, Layers,
-  CheckCircle2, XCircle, Info, ScrollText, Trash2, Eye, EyeOff
+  CheckCircle2, XCircle, Info, ScrollText, Trash2, Eye, EyeOff, Focus
 } from 'lucide-react';
 import { LogEntry, getTimeStr, useLogState } from './ProgressLog';
 import { useTaskQueue } from './TaskContext';
 import CustomSelect from './CustomSelect';
 import { useTranslation } from 'react-i18next';
+import { IMAGE_DETAIL_OPTIONS } from '../utils/imageDetail';
 import InputPathPickerButton from './InputPathPickerButton';
 import Checkbox from './Checkbox';
 import { useUnifiedTaskLogs } from '../hooks/useUnifiedTaskLogs';
@@ -100,6 +101,7 @@ export default function LlmTaggerTab() {
   const [hasErr, setHasErr] = useState(false);
   const [saveMsg, setSaveMsg] = useState<{ text: string; ok: boolean } | null>(null);
   const [imageSize, setImageSize] = useState('1024');
+  const [imageDetail, setImageDetail] = useState('');
   const [topP, setTopP] = useState('');
   const [skipExisting, setSkipExisting] = useState(false);
   const [outputFormat, setOutputFormat] = useState<'txt' | 'json'>('txt');
@@ -206,6 +208,7 @@ export default function LlmTaggerTab() {
           system_prompt: sysPrompt, user_prompt: userPrompt,
           temperature: Number.isFinite(parseFloat(temperature)) ? parseFloat(temperature) : 0.2, max_tokens: parseInt(maxTokens) || -1,
           image_size: parseInt(imageSize) || 1024,
+          image_detail: imageDetail,
           top_p: parseFloat(topP) || 0,
           skip_existing: skipExisting,
           output_format: outputFormat,
@@ -400,6 +403,10 @@ export default function LlmTaggerTab() {
               <div className="form-group" style={{ marginBottom: 0, flex: 1 }}>
                 <label className="form-label" style={{ display: 'flex', alignItems: 'center', gap: 6 }}><Hash style={{ width: 13, height: 13, color: 'var(--color-text-tertiary)' }} /> {t('llmTagger.maxTokens')}</label>
                 <input className="form-input" type="number" min="-1" max="8192" step="1" value={maxTokens} onChange={e => setMaxTokens(e.target.value)} placeholder={t('llmTagger.maxTokensPlaceholder')} />
+              </div>
+              <div className="form-group" style={{ marginBottom: 0, flex: 1 }}>
+                <label className="form-label" style={{ display: 'flex', alignItems: 'center', gap: 6 }}><Focus style={{ width: 13, height: 13, color: 'var(--color-text-tertiary)' }} /> {t('tagRefine.imageDetail')}</label>
+                <CustomSelect value={imageDetail} onChange={setImageDetail} options={IMAGE_DETAIL_OPTIONS(t)} />
               </div>
             </div>
             <div style={{ display: 'flex', gap: 'var(--space-3)' }}>

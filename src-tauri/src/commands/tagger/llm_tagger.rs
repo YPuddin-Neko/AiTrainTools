@@ -44,6 +44,10 @@ pub struct LlmTaggerOptions {
     /// 是否递归扫描子文件夹
     #[serde(default)]
     pub recursive: bool,
+    /// OpenAI Vision 的 image_url.detail：low / high / original / auto。
+    /// 空则整个字段不发送——不认识它的端点会因未知字段报错
+    #[serde(default)]
+    pub image_detail: String,
 }
 
 fn default_image_size() -> u32 {
@@ -84,6 +88,8 @@ struct ChatResponse {
 #[derive(Deserialize)]
 struct ChatChoice {
     message: ChatChoiceMessage,
+    #[serde(default)]
+    finish_reason: Option<String>,
 }
 
 #[derive(Deserialize)]
@@ -462,6 +468,11 @@ async fn tag_with_llm(
     let data_url = format!("data:image/jpeg;base64,{}", b64);
 
     // Build OpenAI-compatible request
+    let mut image_url = serde_json::json!({ "url": data_url });
+    let detail = options.image_detail.trim();
+    if !detail.is_empty() {
+        image_url["detail"] = serde_json::Value::String(detail.to_string());
+    }
     let messages = vec![
         ChatMessage {
             role: "system".to_string(),
@@ -471,7 +482,7 @@ async fn tag_with_llm(
             role: "user".to_string(),
             content: serde_json::json!([
                 { "type": "text", "text": options.user_prompt },
-                { "type": "image_url", "image_url": { "url": data_url } }
+                { "type": "image_url", "image_url": image_url }
             ]),
         },
     ];
@@ -555,6 +566,18 @@ async fn tag_with_llm(
     } else {
         return Err("API 返回空内容".to_string());
     };
+
+    // 服务端安全审核拦下，或模型自己回了一句拒绝：都不能当成描述写进标签文件
+    if matches!(
+        choice.finish_reason.as_deref(),
+        Some("content_filter") | Some("safety")
+    ) {
+        return Err("LLM 内容安全审核拒绝了该图片".to_string());
+    }
+    if crate::commands::looks_like_refusal(&final_content) {
+        let excerpt: String = final_content.trim().chars().take(80).collect();
+        return Err(format!("LLM 拒绝处理该图片（疑似内容安全审核）: {}", excerpt));
+    }
 
     Ok(final_content)
 }

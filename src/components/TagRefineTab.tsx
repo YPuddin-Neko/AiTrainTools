@@ -6,7 +6,7 @@ import {
   FolderOpen, FolderOutput, Loader2, Globe, Key, Bot,
   RefreshCw, MessageSquare, Timer, Layers, Image,
   CheckCircle2, XCircle, Info, ScrollText, Trash2, AlertTriangle, Save, Thermometer,
-  Eye, EyeOff
+  Eye, EyeOff, Focus
 } from 'lucide-react';
 import { LogEntry, getTimeStr, useLogState } from '../components/ProgressLog';
 import { useTaskQueue } from '../components/TaskContext';
@@ -15,6 +15,7 @@ import CustomSelect from '../components/CustomSelect';
 import ProcessButton from '../components/ProcessButton';
 import RecursiveScanToggle from './RecursiveScanToggle';
 import InputPathPickerButton from './InputPathPickerButton';
+import { IMAGE_DETAIL_OPTIONS } from '../utils/imageDetail';
 import { useUnifiedTaskLogs } from '../hooks/useUnifiedTaskLogs';
 
 interface ProcessResult { success_count: number; fail_count: number; total: number; errors: string[]; }
@@ -58,6 +59,7 @@ export default function TagRefineTab() {
   const [temperature, setTemperature] = useState('0.3');
   const [topP, setTopP] = useState('0');
   const [imageSize, setImageSize] = useState('1024');
+  const [imageDetail, setImageDetail] = useState('');
   const [processing, setProcessing] = useState(false);
   const [progress, setProgress] = useState(0);
   const [pCur, setPCur] = useState(0);
@@ -171,6 +173,7 @@ export default function TagRefineTab() {
           temperature: Number.isFinite(parseFloat(temperature)) ? parseFloat(temperature) : 0.3,
           max_tokens: -1,
           image_size: parseInt(imageSize) || 1024,
+          image_detail: imageDetail,
           request_interval_ms: intervalMs,
           concurrency: threads,
           top_p: parseFloat(topP) || 0,
@@ -357,6 +360,10 @@ export default function TagRefineTab() {
                   <Image style={{ width: 13, height: 13, color: 'var(--color-text-tertiary)' }} /> {t('tagRefine.imageSize')}
                 </label>
                 <input className="form-input" type="number" min="256" max="4096" step="128" value={imageSize} onChange={e => setImageSize(e.target.value)} style={{ width: 120 }} />
+              </div>
+              <div className="form-group" style={{ marginBottom: 0 }}>
+                <label className="form-label" style={{ display: 'flex', alignItems: 'center', gap: 6 }}><Focus style={{ width: 13, height: 13, color: 'var(--color-text-tertiary)' }} /> {t('tagRefine.imageDetail')}</label>
+                <CustomSelect value={imageDetail} onChange={setImageDetail} options={IMAGE_DETAIL_OPTIONS(t)} style={{ width: 160 }} />
               </div>
             </div>
           </div>

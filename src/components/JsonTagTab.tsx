@@ -38,7 +38,33 @@ const chipC: Record<AiCatKey, {bg:string;bd:string;tx:string}> = {
 const phdr:React.CSSProperties={display:'flex',alignItems:'center',justifyContent:'space-between',padding:'10px 14px',borderBottom:'1px solid var(--color-border)',flexShrink:0};
 const ptitle:React.CSSProperties={fontSize:12,fontWeight:700,color:'var(--color-text-primary)',textTransform:'uppercase',letterSpacing:'0.5px'};
 
-const normalizeEditableTag=(tag:string)=>tag.trim().replace(/_/g,' ').replace(/\s+/g,' ');
+/** 摊平一份 JSON 标签里的全部标签值（逗号串字段按逗号拆开）。
+ *  标签统计和标签筛选必须共用它：两处各写一份字段列表时，筛选侧漏了 ai_output.count，
+ *  结果点 1girl 这类标签一筛，包含和不包含的图全被滤光。 */
+const collectAllTags=(d:JsonTagData):string[]=>{
+  const out:string[]=[];
+  const pushStr=(s?:string)=>{if(s)s.split(',').map(x=>x.trim()).filter(Boolean).forEach(t=>out.push(t));};
+  const pushArr=(arr?:string[])=>(arr||[]).forEach(t=>{if(t)out.push(t);});
+  pushStr(d.fixed?.quality);pushStr(d.fixed?.series);pushStr(d.fixed?.artist);
+  pushStr(d.character?.name);pushStr(d.character?.variant);pushStr(d.ai_output?.count);
+  pushArr(d.ai_output?.appearance);pushArr(d.ai_output?.tags);pushArr(d.ai_output?.environment);
+  pushArr(d.from_path?.appearance);
+  return out;
+};
+
+// 末尾这次 trim 不能省：TagAutocomplete 提交时会把空格转成下划线，
+// "1girl , solo" 拆开后是 "1girl_"，下划线转回空格就成了带尾空格的标签
+const normalizeEditableTag=(tag:string)=>tag.trim().replace(/_/g,' ').replace(/\s+/g,' ').trim();
+
+/** 一次输入多个标签：按中英文逗号拆开，逐个做下划线→空格等规范化，去空去重（保序） */
+const splitTagInput=(raw:string):string[]=>{
+  const seen=new Set<string>();
+  return raw.split(/[,，]/).map(normalizeEditableTag).filter(t=>{
+    const k=t.toLowerCase();
+    if(!t||seen.has(k))return false;
+    seen.add(k);return true;
+  });
+};
 const SIMPLIFIED_UNSUPPORTED_FIELDS = new Set(['character.variant', 'from_path.appearance']);
 const replaceTagAtIndex=(values:string[],idx:number,raw:string)=>{
   const tag=normalizeEditableTag(raw);
@@ -349,8 +375,8 @@ const JsonTagTab = forwardRef<JsonTagTabHandle, {
       const q=searchText.toLowerCase();
       list=list.filter(img=>{
         if(img.filename.toLowerCase().includes(q)) return true;
-        const d=img.data;
-        const all=[...(d.fixed.quality?.split(',').map(s=>s.trim())||[]),...(d.fixed.series?.split(',').map(s=>s.trim())||[]),...(d.fixed.artist?.split(',').map(s=>s.trim())||[]),d.character.name,d.character.variant,d.ai_output.count||'',...d.ai_output.appearance,...d.ai_output.tags,...d.ai_output.environment,...d.from_path.appearance,d.ai_output.nl||''];
+        // 搜索比筛选多带一个 nl（自然语言描述里也能搜到词）
+        const all=[...collectAllTags(img.data),img.data.ai_output?.nl||''];
         return all.some(t=>t.toLowerCase().includes(q));
       });
     }
@@ -358,8 +384,7 @@ const JsonTagTab = forwardRef<JsonTagTabHandle, {
     if(filterMode==='untagged')list=list.filter(img=>!img.has_json);
     if(tagFilterActive&&selectedTags.size>0){
       list=list.filter(img=>{
-        const d=img.data;
-        const allTags=[...(d.fixed.quality?.split(',').map(s=>s.trim())||[]),...(d.fixed.series?.split(',').map(s=>s.trim())||[]),...(d.fixed.artist?.split(',').map(s=>s.trim())||[]),d.character.name,d.character.variant,...d.ai_output.appearance,...d.ai_output.tags,...d.ai_output.environment,...d.from_path.appearance].filter(Boolean);
+        const allTags=collectAllTags(img.data);
         return [...selectedTags].every(t=>allTags.includes(t));
       });
     }
@@ -369,15 +394,8 @@ const JsonTagTab = forwardRef<JsonTagTabHandle, {
   // Tag statistics for Col3 sidebar
   const tagStats=useMemo(()=>{
     const m:Record<string,number>={};
-    images.forEach(img=>{
-      const d=img.data;
-      const collect=(arr:string[])=>arr.forEach(t=>{if(t)m[t]=(m[t]||0)+1;});
-      const collectStr=(s:string|undefined)=>{if(s)s.split(',').map(x=>x.trim()).filter(Boolean).forEach(t=>{m[t]=(m[t]||0)+1;});};
-      collectStr(d.fixed.quality);collectStr(d.fixed.series);collectStr(d.fixed.artist);
-      collectStr(d.character.name);collectStr(d.character.variant);collectStr(d.ai_output.count);
-      collect(d.ai_output.appearance);collect(d.ai_output.tags);collect(d.ai_output.environment);
-      collect(d.from_path.appearance);
-    });
+    // 与筛选共用 collectAllTags：列表里点得到的标签，筛选就一定能筛出来
+    images.forEach(img=>collectAllTags(img.data).forEach(t=>{m[t]=(m[t]||0)+1;}));
     return Object.entries(m).sort((a,b)=>b[1]-a[1]);
   },[images]);
 
@@ -755,7 +773,7 @@ const JsonTagTab = forwardRef<JsonTagTabHandle, {
           placeholder={t('jsonTag.inputTag')}
           clearOnSelect={true}
           keepOpen={true}
-          onSelect={(v) => { const tag=normalizeEditableTag(v); if(tag)onAdd(tag); }}
+          onSelect={(v) => { splitTagInput(v).forEach(onAdd); }}
           onBlur={() => setEditingField(null)}
           onKeyDown={(e) => { if (e.key === 'Escape') setEditingField(null); }}
           inputStyle={{fontSize:11,height:24,border:'none',background:'transparent',padding:'0 4px',flex:'1 0 60px',minWidth:60,outline:'none',maxWidth:200}}
@@ -874,10 +892,14 @@ const JsonTagTab = forwardRef<JsonTagTabHandle, {
                     else onSet(newParts.join(', '));
                     setEditingChip(null);
                   };
-                  const addOne = (v:string) => {
-                    if(parts.some(p=>p.toLowerCase()===v.toLowerCase()))return; // 与数组字段一致：不加重复标签
-                    if(parts.length===0) onSet(v);
-                    else onSet([...parts, v].join(', '));
+                  // 一次可能来好几个标签，必须一趟算完再 onSet：
+                  // 逐个调用会各自基于渲染时的 parts，后一个把前一个覆盖掉
+                  const addMany = (vals:string[]) => {
+                    const next=[...parts];
+                    vals.forEach(v=>{
+                      if(!next.some(p=>p.toLowerCase()===v.toLowerCase()))next.push(v); // 与数组字段一致：不加重复标签
+                    });
+                    if(next.length!==parts.length)onSet(next.join(', '));
                   };
                   if(!chipRefsMap.current[fieldKey])chipRefsMap.current[fieldKey]=[];
                   return (
@@ -927,7 +949,7 @@ const JsonTagTab = forwardRef<JsonTagTabHandle, {
                         placeholder={ph}
                         clearOnSelect={true}
                         keepOpen={true}
-                        onSelect={(v) => { const tag=normalizeEditableTag(v); if(tag)addOne(tag); }}
+                        onSelect={(v) => addMany(splitTagInput(v))}
                         onBlur={() => setEditingField(null)}
                         onKeyDown={(e) => { if (e.key === 'Escape') setEditingField(null); }}
                         inputStyle={{fontSize:11,height:24,border:'none',background:'transparent',padding:'0 4px',flex:1,minWidth:60,outline:'none',maxWidth:200}}

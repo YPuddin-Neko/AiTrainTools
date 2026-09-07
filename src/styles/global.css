@@ -10,6 +10,10 @@
   box-sizing: border-box;
   user-select: none;
   -webkit-user-select: none;
+  /* 内部容器（提示词框、日志、各种列表）滚到边界后不再把滚动传给整页。
+     对不可滚动的元素无副作用，所以直接铺在通配规则里，
+     省得 30 多个滚动容器逐个补内联 overscrollBehavior */
+  overscroll-behavior: contain;
 }
 
 /* 输入框和文本框保留文字选中能力 */

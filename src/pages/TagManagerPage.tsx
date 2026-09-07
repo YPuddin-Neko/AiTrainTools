@@ -593,7 +593,10 @@ export default function TagManagerPage() {
   };
 
   const handleKeyDown = useCallback((e:React.KeyboardEvent)=>{
-    if(e.target instanceof HTMLInputElement) return;
+    // 光标在任何可编辑控件里时，方向键归它——textarea（nl 字段是多行）和
+    // contenteditable 早先没排除，在里面按左右会被拿去切换图片
+    const el = e.target as HTMLElement | null;
+    if(el instanceof HTMLInputElement || el instanceof HTMLTextAreaElement || el?.isContentEditable) return;
     if(e.key==='ArrowLeft'){e.preventDefault();goPrev();}
     if(e.key==='ArrowRight'){e.preventDefault();goNext();}
   },[goPrev,goNext]);
@@ -820,11 +823,18 @@ export default function TagManagerPage() {
                 placeholder={t('tagManager.inputTagPlaceholder')}
                 clearOnSelect={true}
                 keepOpen={true}
-                onSelect={(tag) => {
-                  const v = tag.trim().toLowerCase().replace(/_/g, ' ');
-                  if (v && cur && !cur.tags.includes(v)) {
-                    setImages(p => p.map((img, i) => i === selectedIdx ? { ...img, tags: [...img.tags, v], dirty: true } : img));
-                  }
+                onSelect={(raw) => {
+                  // 支持一次输入多个：逗号分隔，逐个规范化（下划线→空格、合并多空格、转小写）
+                  const incoming = raw.split(/[,，]/)
+                    .map(s => s.trim().toLowerCase().replace(/_/g, ' ').replace(/\s+/g, ' ').trim())
+                    .filter(Boolean);
+                  if (!incoming.length) return;
+                  setImages(p => p.map((img, i) => {
+                    if (i !== selectedIdx) return img;
+                    const next = [...img.tags];
+                    incoming.forEach(v => { if (!next.includes(v)) next.push(v); });
+                    return next.length === img.tags.length ? img : { ...img, tags: next, dirty: true };
+                  }));
                 }}
                 onBlur={() => setEditingDanbooru(false)}
                 onKeyDown={(e) => { if (e.key === 'Escape') setEditingDanbooru(false); }}

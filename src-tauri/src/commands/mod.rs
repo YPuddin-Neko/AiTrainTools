@@ -175,6 +175,45 @@ fn is_supported_image_file(path: &Path) -> bool {
         .unwrap_or(false)
 }
 
+/// 模型因内容安全审核拒绝时的典型措辞（小写匹配）
+const REFUSAL_MARKERS: [&str; 18] = [
+    "i'm sorry",
+    "i am sorry",
+    "i cannot",
+    "i can't",
+    "i'm unable",
+    "i am unable",
+    "unable to assist",
+    "cannot assist",
+    "can't assist",
+    "cannot help",
+    "can't help",
+    "cannot provide",
+    "can't provide",
+    "against my",
+    "content policy",
+    "抱歉",
+    "无法处理",
+    "不能提供",
+];
+
+/// 判断整段回复是不是"模型拒绝了"（NSFW 触发安全审核等）。
+///
+/// 关键闸是逗号数量：标签列表天然含大量逗号，而拒绝语是一两句自然语言。
+/// 不设这道闸的话，正常回复里出现 "i can't" 之类的字样就会被误杀。
+/// 调用方还应先确认回复里没有按格式返回的标记段——模型按格式回了就说明它没拒绝。
+pub(crate) fn looks_like_refusal(content: &str) -> bool {
+    let trimmed = content.trim();
+    if trimmed.is_empty() {
+        return false;
+    }
+    if trimmed.matches(',').count() >= 3 || trimmed.matches('，').count() >= 3 {
+        return false;
+    }
+    let lower = trimmed.to_lowercase();
+    REFUSAL_MARKERS.iter().any(|m| lower.contains(m))
+}
+
 /// 工具自己产出的副本目录：失败/警告文件会被复制到这里备查。
 /// 它们常常就落在数据集根目录内，递归扫描时必须跳过，否则副本会被当成新图反复处理。
 /// 全应用统一用 `Fail`/`Warn`；`_errors`/`_warnings` 是旧版遗留，仍需剪枝。
@@ -202,6 +241,17 @@ pub(crate) fn is_prunable_artifact_dir(entry: &walkdir::DirEntry) -> bool {
             .is_some_and(is_artifact_dir_name)
 }
 
+/// 取路径的"目录形态"：各页的输入都可以是单张图片，
+/// 拿它当目录用（create_dir_all、join 子目录）会造出 `图片.png/xxx` 这种非法路径，
+/// Windows 上直接报"当文件已存在时，无法创建该文件"。
+pub fn dir_of(path: &Path) -> std::path::PathBuf {
+    if path.is_file() {
+        path.parent().unwrap_or(path).to_path_buf()
+    } else {
+        path.to_path_buf()
+    }
+}
+
 /// 把出问题的源文件复制到 `<root>/<dir_name>/`，递归模式下保留相对子目录结构。
 /// 返回实际复制成功的数量；目录建不出来则返回 Err，单个文件复制失败只是不计数。
 pub fn copy_files_into_artifact_dir(
@@ -211,7 +261,8 @@ pub fn copy_files_into_artifact_dir(
     dir_name: &str,
     recursive: bool,
 ) -> Result<u32, String> {
-    let target_root = root.join(dir_name);
+    // root 可能是单张图片的路径，落到它所在的目录
+    let target_root = dir_of(root).join(dir_name);
     std::fs::create_dir_all(&target_root)
         .map_err(|e| format!("创建 {} 文件夹失败: {}", dir_name, e))?;
 
@@ -980,6 +1031,23 @@ mod artifact_dir_tests {
         // 用户直接选中 Fail 目录重跑失败图，不能给出"没有图片"
         let files = collect_image_files_recursive(&root.join("Fail")).unwrap();
         assert_eq!(names(&files), vec!["b.png"]);
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// 输入选的是单张图片时，产物目录要落在它所在的文件夹，
+    /// 而不是拼成 `图片.png/Fail`（Windows 上报"当文件已存在时，无法创建该文件"）
+    #[test]
+    fn artifact_dir_falls_back_to_parent_for_single_image() {
+        let root = fixture("single");
+        let single = root.join("a.png");
+        assert_eq!(dir_of(&single), root);
+        // root 传成图片路径也不该炸
+        let copied =
+            copy_files_into_artifact_dir(&single, &single, &[single.clone()], "Fail", false)
+                .unwrap();
+        assert_eq!(copied, 1);
+        assert!(root.join("Fail/a.png").exists());
+        assert!(!root.join("a.png/Fail").exists());
         let _ = std::fs::remove_dir_all(&root);
     }
 

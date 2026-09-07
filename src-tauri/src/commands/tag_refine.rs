@@ -34,6 +34,10 @@ pub struct TagRefineOptions {
     /// 标签文件格式: "txt"（默认）| "json"（完整/简化格式自动识别，差量写回保留原分类）
     #[serde(default = "default_file_format")]
     pub file_format: String,
+    /// OpenAI Vision 的 image_url.detail：low / high / original / auto。
+    /// 空则整个字段不发送——Gemini 兼容层等不认识它的端点会因未知字段报错
+    #[serde(default)]
+    pub image_detail: String,
 }
 
 fn default_file_format() -> String {
@@ -126,7 +130,9 @@ pub async fn start_tag_refining(
 
     let input_dir = Path::new(&options.input_path);
     let input_dir_path = input_dir.to_path_buf();
-    let output_dir_path = PathBuf::from(&options.output_path);
+    // 输入可以是单张图片，辅助打标又固定把输入路径当输出路径传进来。
+    // 不取所在目录的话，下面的 create_dir_all 会试图创建一个与图片同名的目录
+    let output_dir_path = crate::commands::dir_of(Path::new(&options.output_path));
 
     // 失败/警告图副本落在 Fail、Warn 里，收集侧已统一剪枝，不会被当成新图
     let files = collect_image_files_with_recursive_excluding(
@@ -334,14 +340,17 @@ pub async fn start_tag_refining(
     let warn_files_list = warning_files.lock().await.clone();
     let mut copy_msg = String::new();
 
+    // 单图输入时 input_dir_path 是文件，得跟它所在目录比，否则"就地更新"会被误判成
+    // 输入输出不同目录，把整份警告图复制一遍
+    let input_cmp_dir = crate::commands::dir_of(&input_dir_path);
     let same_io_dir = match (
         std::fs::canonicalize(&output_dir_path),
-        std::fs::canonicalize(&input_dir_path),
+        std::fs::canonicalize(&input_cmp_dir),
     ) {
         (Ok(a), Ok(b)) => a == b,
         _ => {
             crate::commands::path_key_ci(&output_dir_path)
-                == crate::commands::path_key_ci(&input_dir_path)
+                == crate::commands::path_key_ci(&input_cmp_dir)
         }
     };
 
@@ -1100,11 +1109,16 @@ async fn refine_tags_with_llm(
     };
 
     // 构造多模态请求（图片 + 文字）
+    let mut image_url = serde_json::json!({ "url": data_url });
+    let detail = options.image_detail.trim();
+    if !detail.is_empty() {
+        image_url["detail"] = serde_json::Value::String(detail.to_string());
+    }
     let messages = vec![ChatMessage {
         role: "user".to_string(),
         content: serde_json::json!([
             { "type": "text", "text": user_text },
-            { "type": "image_url", "image_url": { "url": data_url } }
+            { "type": "image_url", "image_url": image_url }
         ]),
     }];
 
@@ -1174,6 +1188,13 @@ async fn refine_tags_with_llm(
     if choice.finish_reason.as_deref() == Some("length") {
         return Err("响应因 max_tokens 被截断，已丢弃（请调大 max_tokens）".to_string());
     }
+    // 服务端内容安全审核直接拦下：这张图不该被当成"处理成功"
+    if matches!(
+        choice.finish_reason.as_deref(),
+        Some("content_filter") | Some("safety")
+    ) {
+        return Err("LLM 内容安全审核拒绝了该图片，标签未改动".to_string());
+    }
 
     let content = choice
         .message
@@ -1198,10 +1219,28 @@ async fn refine_tags_with_llm(
         return Err("API 返回空内容".to_string());
     };
 
-    // 优先解析标记格式（辅助打标 JSON 模式的默认提示词要求此格式）；
-    // 无标记时退回旧启发式：多行取最长的含逗号行。
-    // NL 段先于启发式剥离——自然语言长句常含逗号且比标签列表更长，会被启发式误选
-    let marker = split_marker_response(&final_content);
+    parse_refine_response(&final_content, tags)
+}
+
+/// 把 LLM 的原始回复解析成 (最终标签, nl, 字段归属)。
+/// 优先走标记格式（辅助打标 JSON 模式的默认提示词要求此格式）；
+/// 无标记时退回旧启发式：多行取最长的含逗号行。
+/// NL 段先于启发式剥离——自然语言长句常含逗号且比标签列表更长，会被启发式误选。
+fn parse_refine_response(
+    content: &str,
+    original_tags: &[String],
+) -> Result<(Vec<String>, Option<String>, TagBuckets), String> {
+    let marker = split_marker_response(content);
+
+    // 模型拒绝（NSFW 触发安全审核等）：拒绝语必须判失败，
+    // 否则会被下面的"最长含逗号行"启发式当成标签写进标签文件
+    let has_markers =
+        marker.buckets.slots().iter().any(|s| s.is_some()) || marker.nl.is_some();
+    if !has_markers && crate::commands::looks_like_refusal(content) {
+        let excerpt: String = content.trim().chars().take(80).collect();
+        return Err(format!("LLM 拒绝处理该图片（疑似内容安全审核）: {}", excerpt));
+    }
+
     // 孤零零一个 count 段不足以判定是标记格式，让它退回启发式而不是劫持整个标签列表
     let refined_tags: Vec<String> = if marker.buckets.tags.is_some()
         || marker.buckets.has_field_assignment()
@@ -1221,6 +1260,11 @@ async fn refine_tags_with_llm(
         };
         split_tag_line(&cleaned)
     };
+
+    // 只回了 NL: 一段（"仅补 nl 描述"这类提示词）：标签原样保留，不是失败
+    if refined_tags.is_empty() && marker.nl.is_some() {
+        return Ok((original_tags.to_vec(), marker.nl, TagBuckets::default()));
+    }
 
     if refined_tags.is_empty() {
         return Err("AI 返回的细化结果为空".to_string());
@@ -1323,6 +1367,59 @@ mod marker_tests {
         let m = split_marker_response("COUNT: 1girl\nENVIRONMENT:\nTAGS: smile");
         assert_eq!(m.buckets.environment, Some(vec![]));
         assert!(m.buckets.appearance.is_none());
+    }
+
+    /// "仅补 nl 描述"的提示词：模型只回一段 NL，标签必须原样保留而不是判定失败
+    #[test]
+    fn nl_only_response_keeps_tags() {
+        let original: Vec<String> = ["1girl", "long hair", "smile"]
+            .iter()
+            .map(|s| s.to_string())
+            .collect();
+        let (tags, nl, buckets) =
+            parse_refine_response("NL: A girl with long hair smiles.", &original).unwrap();
+        assert_eq!(tags, original);
+        assert_eq!(nl.as_deref(), Some("A girl with long hair smiles."));
+        assert_eq!(buckets, TagBuckets::default());
+    }
+
+    /// 既没有标签也没有 NL 才算失败
+    #[test]
+    fn truly_empty_response_is_error() {
+        assert!(parse_refine_response("", &[]).is_err());
+        assert!(parse_refine_response("\n\n", &[]).is_err());
+        // 拒绝语同样是 Err（走的是拒绝识别那条路，不是"空响应"）
+        assert!(parse_refine_response("Sorry, I cannot help.", &[]).is_err());
+        // 普通单行仍按标签处理
+        assert!(parse_refine_response("1girl, solo", &[]).is_ok());
+    }
+
+    /// 安全审核拒绝：必须判失败，绝不能把拒绝语当成标签写进标签文件
+    #[test]
+    fn refusal_is_rejected_not_written_as_tags() {
+        for refusal in [
+            "I'm sorry, I can't help with that.",
+            "I cannot assist with this request.",
+            "抱歉，我无法处理这张图片。",
+            "I am unable to describe this image due to content policy.",
+        ] {
+            assert!(
+                parse_refine_response(refusal, &["1girl".to_string()]).is_err(),
+                "应判为拒绝: {refusal}"
+            );
+        }
+    }
+
+    /// 正常标签列表里出现拒绝措辞的字样不能被误杀——逗号数量是那道闸
+    #[test]
+    fn normal_tag_lists_are_not_mistaken_for_refusal() {
+        // 逗号多 = 标签列表，即便含 "i can't" 之类的字样
+        let tags = "1girl, solo, i can't believe it's not butter, smile, outdoors";
+        let (parsed, _, _) = parse_refine_response(tags, &[]).unwrap();
+        assert!(parsed.contains(&"1girl".to_string()));
+        // 按标记格式返回的短回复也不该被误判
+        let marked = parse_refine_response("TAGS: sorry\nNL: I'm sorry.", &[]).unwrap();
+        assert_eq!(marked.0, vec!["sorry".to_string()]);
     }
 
     /// 闲聊行 `Count: 15 tags` 不能被当成字段归属，否则整份标签会被它替换掉

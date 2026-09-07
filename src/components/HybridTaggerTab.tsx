@@ -3,8 +3,9 @@ import { invoke } from '@tauri-apps/api/core';
 import { listen } from '../utils/tauriRuntime';
 import {
   Key, Bot, RefreshCw, Loader2, Eye, EyeOff, Save, Thermometer, Image as ImageIcon,
-  Check, Cpu, Gpu,
+  Check, Cpu, Gpu, Trash2, Focus,
 } from 'lucide-react';
+import { Modal } from './Modal';
 import ProgressLog, { getTimeStr, useLogState } from './ProgressLog';
 import ProcessButton from './ProcessButton';
 import InputPathPickerButton from './InputPathPickerButton';
@@ -13,6 +14,7 @@ import Checkbox from './Checkbox';
 import { useTaskQueue } from './TaskContext';
 import { useUnifiedTaskLogs } from '../hooks/useUnifiedTaskLogs';
 import { useTranslation } from 'react-i18next';
+import { IMAGE_DETAIL_OPTIONS } from '../utils/imageDetail';
 
 interface ModelInfo { id: string; name: string; description: string; input_size: number; is_builtin: boolean; is_downloaded: boolean; repo_id: string; input_format: string; supported_categories: string[]; }
 interface ProcessResult { success_count: number; fail_count: number; total: number; errors: string[]; }
@@ -41,9 +43,10 @@ Existing tags: {tags}
 Refined tags:`;
 
 /** 默认调优提示词（JSON 模式）：在 TXT 模式基础上，要求 LLM 把标签分配到
- *  count/appearance/environment/tags 四个字段，并补写 nl 自然语言描述。
+ *  count/appearance/tags/environment 四个字段，并补写 nl 自然语言描述。
  *  本地打标器这四类是靠关键词表猜的（"simple background" 之类常落错格），
- *  由 LLM 按画面重新归类；后端解析 COUNT:/APPEARANCE:/ENVIRONMENT:/TAGS:/NL: 标记段。
+ *  由 LLM 按画面重新归类；后端解析 COUNT:/APPEARANCE:/TAGS:/ENVIRONMENT:/NL: 标记段。
+ *  四类语义按 AnimaLoraStudio 打标文档：表情/姿势/构图属 tags 而非 appearance。
  *  quality/series/artist/character 来自 tagger 的模型分类，不在重排范围内。 */
 const defaultPromptJson = `You are an expert anime image tagger. You will receive an image and its existing tags produced by a local tagger model.
 
@@ -79,8 +82,36 @@ TAGS: <comma-separated>
 ENVIRONMENT: <comma-separated>
 NL: <natural language description>`;
 
+/** 仅补 nl 描述：不动任何标签，只根据画面和现有标签写自然语言描述。
+ *  本地打标器不产生 nl 字段，这个预设专门补它；后端见到只有 NL: 一段的回复会保留原标签。 */
+const promptNlOnly = `You are an expert anime image tagger. You will receive an image and its existing tags produced by a local tagger model.
+
+Your task:
+Write a natural language description (1-2 sentences) of the image, consistent with the image content and the existing tags.
+
+Rules:
+- Do NOT modify, add or remove any tags
+- Describe only what is clearly visible
+- Do NOT add explanations
+
+Existing tags: {tags}
+
+Reply in exactly this format (one line, nothing else):
+NL: <natural language description>`;
+
 const defaultPromptFor = (fmt: 'txt' | 'json' | 'json_simplified') =>
   fmt === 'txt' ? defaultPromptTxt : defaultPromptJson;
+
+interface PromptPreset { id: string; name: string; prompt: string }
+const CUSTOM_PRESETS_KEY = 'hybrid_prompt_presets';
+
+const loadCustomPresets = (): PromptPreset[] => {
+  try {
+    const raw = localStorage.getItem(CUSTOM_PRESETS_KEY);
+    const list = raw ? JSON.parse(raw) : [];
+    return Array.isArray(list) ? list.filter((p: PromptPreset) => p?.id && p?.name) : [];
+  } catch { return []; }
+};
 
 export default function HybridTaggerTab() {
   const { t } = useTranslation();
@@ -123,9 +154,14 @@ export default function HybridTaggerTab() {
   const [fetchMsg, setFetchMsg] = useState<{ text: string; ok: boolean } | null>(null);
   const [saveMsg, setSaveMsg] = useState<{ text: string; ok: boolean } | null>(null);
   const [prompt, setPrompt] = useState(defaultPromptTxt);
+  const [presetId, setPresetId] = useState('builtin_full');
+  const [customPresets, setCustomPresets] = useState<PromptPreset[]>(loadCustomPresets);
+  const [showSaveModal, setShowSaveModal] = useState(false);
+  const [newPresetName, setNewPresetName] = useState('');
   const [temperature, setTemperature] = useState('0.3');
   const [topP, setTopP] = useState('0');
   const [imageSize, setImageSize] = useState('1024');
+  const [imageDetail, setImageDetail] = useState('');
   const [concurrency, setConcurrency] = useState('1');
   const [intervalSec, setIntervalSec] = useState('-1');
 
@@ -243,14 +279,60 @@ export default function HybridTaggerTab() {
   const isJson = outputFormat !== 'txt';
   const canStart = !!inputPath && !!selectedModel && !!endpoint && !!modelName && enabledCats.size > 0;
 
-  // 切换输出格式时联动默认提示词（JSON 模式要求 TAGS:/NL: 格式以补写 nl 字段）；
-  // 用户改过提示词则不动
+  // 内置预设 + 用户预设。「仅补 NL」只在 JSON 模式下有意义（txt 没有 nl 字段）
+  const builtinPresets: PromptPreset[] = [
+    { id: 'builtin_full', name: t('hybridTagger.presetFull'), prompt: defaultPromptFor(outputFormat) },
+    ...(isJson ? [{ id: 'builtin_nl', name: t('hybridTagger.presetNlOnly'), prompt: promptNlOnly }] : []),
+  ];
+  const allPresets = [...builtinPresets, ...customPresets];
+  const isCustomPreset = customPresets.some(p => p.id === presetId);
+
+  const applyPreset = (id: string) => {
+    setPresetId(id);
+    const p = allPresets.find(x => x.id === id);
+    if (p) setPrompt(p.prompt);
+  };
+
+  const persistPresets = (list: PromptPreset[]) => {
+    setCustomPresets(list);
+    try { localStorage.setItem(CUSTOM_PRESETS_KEY, JSON.stringify(list)); } catch { /* 配额满等，忽略 */ }
+  };
+
+  const handleSavePreset = () => {
+    const name = newPresetName.trim();
+    if (!name) return;
+    const existing = customPresets.find(p => p.name === name);
+    const id = existing ? existing.id : `u_${Date.now()}`;
+    persistPresets(existing
+      ? customPresets.map(p => (p.id === existing.id ? { ...p, prompt } : p))
+      : [...customPresets, { id, name, prompt }]);
+    setPresetId(id);
+    setShowSaveModal(false);
+    setNewPresetName('');
+  };
+
+  const handleDeletePreset = () => {
+    persistPresets(customPresets.filter(p => p.id !== presetId));
+    setPresetId('builtin_full');
+    // 编辑框内容保留不动：删错了立刻再存一次就回来了，省一个确认弹窗
+  };
+
+  // 切换输出格式时联动默认提示词（JSON 模式要求标记格式以补写 nl 字段）；
+  // 用户改过提示词或选了自定义预设则不动
   const handleFormatChange = (v: string) => {
     const next = v as typeof outputFormat;
     setOutputFormat(next);
-    setPrompt(prev =>
-      prev === defaultPromptTxt || prev === defaultPromptJson ? defaultPromptFor(next) : prev
-    );
+    if (presetId === 'builtin_nl' && next === 'txt') {
+      // 「仅补 NL」在 txt 下不可用，退回完整调优
+      setPresetId('builtin_full');
+      setPrompt(defaultPromptFor(next));
+      return;
+    }
+    if (presetId === 'builtin_full') {
+      setPrompt(prev =>
+        prev === defaultPromptTxt || prev === defaultPromptJson ? defaultPromptFor(next) : prev
+      );
+    }
   };
 
   const handleStart = async () => {
@@ -310,6 +392,7 @@ export default function HybridTaggerTab() {
           temperature: Number.isFinite(parseFloat(temperature)) ? parseFloat(temperature) : 0.3,
           max_tokens: -1,
           image_size: parseInt(imageSize) || 1024,
+          image_detail: imageDetail,
           top_p: parseFloat(topP) || 0,
           request_interval_ms: intervalMs,
           concurrency: threads,
@@ -494,7 +577,23 @@ export default function HybridTaggerTab() {
       <div className="tool-panel">
         <div className="tool-panel-header">
           <span className="tool-panel-title">{t('hybridTagger.llmPhase')}</span>
-          <button className="btn btn-ghost btn-sm" style={{ fontSize: 10 }} onClick={() => setPrompt(defaultPromptFor(outputFormat))}>{t('tagSort.resetDefault')}</button>
+          <div style={{ display: 'flex', alignItems: 'center', gap: 6 }}>
+            <CustomSelect compact value={presetId} onChange={applyPreset}
+              options={allPresets.map(p => ({ value: p.id, label: p.name }))} style={{ width: 190 }} />
+            <button className="btn btn-ghost btn-sm" style={{ fontSize: 10, padding: '4px 6px' }}
+              title={t('hybridTagger.savePreset')}
+              onClick={() => { setNewPresetName(isCustomPreset ? (allPresets.find(p => p.id === presetId)?.name || '') : ''); setShowSaveModal(true); }}>
+              <Save style={{ width: 13, height: 13 }} />
+            </button>
+            {/* 常驻显示，内置预设时置灰——藏起来会让人以为没有删除功能 */}
+            <button className="btn btn-ghost btn-sm" disabled={!isCustomPreset}
+              style={{ fontSize: 10, padding: '4px 6px', color: isCustomPreset ? '#f87171' : undefined, opacity: isCustomPreset ? 1 : 0.35 }}
+              title={t('hybridTagger.deletePreset')} onClick={handleDeletePreset}>
+              <Trash2 style={{ width: 13, height: 13 }} />
+            </button>
+            <button className="btn btn-ghost btn-sm" style={{ fontSize: 10 }}
+              onClick={() => applyPreset(presetId)}>{t('tagSort.resetDefault')}</button>
+          </div>
         </div>
         <div style={{ display: 'grid', gridTemplateColumns: '1fr 300px', gap: 'var(--space-4)', alignItems: 'stretch' }}>
           {/* 左：提示词 */}
@@ -532,6 +631,10 @@ export default function HybridTaggerTab() {
                 <label className="form-label">{t('hybridTagger.interval')}</label>
                 <input className="form-input" type="number" step="0.1" value={intervalSec} onChange={e => setIntervalSec(e.target.value)} />
               </div>
+            </div>
+            <div>
+              <label className="form-label" style={{ display: 'flex', alignItems: 'center', gap: 4 }}><Focus style={{ width: 12, height: 12, color: 'var(--color-text-tertiary)' }} /> {t('tagRefine.imageDetail')}</label>
+              <CustomSelect value={imageDetail} onChange={setImageDetail} options={IMAGE_DETAIL_OPTIONS(t)} />
             </div>
             <div>
               <label className="form-label">{t('hybridTagger.outputFormat')}</label>
@@ -575,6 +678,19 @@ export default function HybridTaggerTab() {
         hasError={hasErr}
         onClearLogs={clearLogs}
       />
+
+      <Modal open={showSaveModal} onClose={() => setShowSaveModal(false)} title={t('hybridTagger.savePreset')}>
+        <div style={{ display: 'flex', flexDirection: 'column', gap: 'var(--space-3)' }}>
+          <input className="form-input" autoFocus value={newPresetName}
+            placeholder={t('hybridTagger.presetNamePlaceholder')}
+            onChange={e => setNewPresetName(e.target.value)}
+            onKeyDown={e => { if (e.key === 'Enter') handleSavePreset(); }} />
+          <div style={{ display: 'flex', justifyContent: 'flex-end', gap: 'var(--space-2)' }}>
+            <button className="btn btn-secondary btn-sm" onClick={() => setShowSaveModal(false)}>{t('common.cancel')}</button>
+            <button className="btn btn-primary btn-sm" disabled={!newPresetName.trim()} onClick={handleSavePreset}>{t('common.save')}</button>
+          </div>
+        </div>
+      </Modal>
     </div>
   );
 }
