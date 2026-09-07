@@ -331,7 +331,12 @@ export default function HybridTaggerTab() {
 
   // 内置预设 + 用户预设。「仅补 NL」只在 JSON 模式下有意义（txt 没有 nl 字段）
   const builtinPresets: PromptPreset[] = [
-    { id: 'builtin_full', name: t('hybridTagger.presetFull'), prompt: defaultPromptFor(outputFormat) },
+    // txt 只做标签调优（没有 nl 字段可写），JSON 才是"调标签 + 补自然语言描述"
+    {
+      id: 'builtin_full',
+      name: isJson ? t('hybridTagger.presetFull') : t('hybridTagger.presetTagsOnly'),
+      prompt: defaultPromptFor(outputFormat),
+    },
     // 「仅补自然语言描述」只有 JSON 有 nl 字段可写
     ...(isJson ? [{ id: 'builtin_nl', name: t('hybridTagger.presetNlOnly'), prompt: promptNlOnly }] : []),
     // 「详细自然语言打标」整段 caption 就是 txt 的全部内容，标签只作为 LLM 的校准参考

@@ -700,6 +700,7 @@ const en = {
     localPhase: 'Local Tagging',
     llmPhase: 'LLM Refinement',
     presetFull: 'Refine tags + description',
+    presetTagsOnly: 'Refine tags',
     presetNlOnly: 'Description only',
     presetDetailedCaption: 'Detailed caption',
     savePreset: 'Save as preset',
