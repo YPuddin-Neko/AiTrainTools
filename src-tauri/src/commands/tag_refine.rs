@@ -38,6 +38,11 @@ pub struct TagRefineOptions {
     /// 空则整个字段不发送——Gemini 兼容层等不认识它的端点会因未知字段报错
     #[serde(default)]
     pub image_detail: String,
+    /// 自然语言打标模式（仅 txt）：LLM 的回复整段就是标签文件的内容，
+    /// 不做标签解析、不做增删对比。本地标签只作为 LLM 的校准参考，不写回文件。
+    /// 与 JSON 的 nl 字段无关——JSON 路径完全不走这里
+    #[serde(default)]
+    pub caption_mode: bool,
 }
 
 fn default_file_format() -> String {
@@ -99,6 +104,13 @@ enum FileResult {
         refined_count: usize,
         changed: bool,
         warnings: Vec<String>,
+        elapsed_ms: u128,
+    },
+    /// 自然语言打标：写入的是一整段描述，没有"标签数"和增删可言
+    Captioned {
+        filename: String,
+        original_count: usize,
+        word_count: usize,
         elapsed_ms: u128,
     },
     Skipped {
@@ -282,6 +294,33 @@ pub async fn start_tag_refining(
                                 } else {
                                     ""
                                 }
+                            ),
+                            ..Default::default()
+                        },
+                    );
+                }
+                FileResult::Captioned {
+                    filename,
+                    original_count,
+                    word_count,
+                    elapsed_ms,
+                } => {
+                    success_count.fetch_add(1, Ordering::SeqCst);
+                    let elapsed_str = if elapsed_ms >= 1000 {
+                        format!("{:.1}s", elapsed_ms as f64 / 1000.0)
+                    } else {
+                        format!("{}ms", elapsed_ms)
+                    };
+                    let _ = app.emit(
+                        "tag-refine-progress",
+                        ProgressEvent {
+                            current: cur,
+                            total,
+                            filename: filename.clone(),
+                            status: "success".to_string(),
+                            message: format!(
+                                "[完成] {} | 参考 {} 个标签 → 描述 {} 词 | {}",
+                                filename, original_count, word_count, elapsed_str
                             ),
                             ..Default::default()
                         },
@@ -636,6 +675,17 @@ fn apply_refined_tags_to_json(data: &mut serde_json::Value, refined: &[String]) 
     }
 }
 
+/// 一次 LLM 调用的产出。两条路径互斥：
+/// 标签路径解析出标签/nl/字段归属；自然语言打标路径只有一整段文本。
+enum RefineOutput {
+    Tags {
+        tags: Vec<String>,
+        nl: Option<String>,
+        buckets: TagBuckets,
+    },
+    Caption(String),
+}
+
 /// LLM 按字段归类返回的结果，顺序对齐 `JsonTagLayout::bucket_paths`。
 /// `None` = 响应里没有这一段，该字段维持本地打标器给的归属（只做删除清理）。
 #[derive(Debug, Default, Clone, PartialEq)]
@@ -960,7 +1010,44 @@ async fn process_single_file(
 
     // 调用 LLM 细化
     match refine_tags_with_llm(client, img_path, &original_tags, options, last_req_time).await {
-        Ok((refined_tags, nl, buckets)) => {
+        // 自然语言打标：整段描述直接落盘，标签只是刚才喂给 LLM 的参考
+        Ok(RefineOutput::Caption(caption)) => {
+            let elapsed_ms = start.elapsed().as_millis();
+            let output_name = format!("{}.{}", stem, tag_ext);
+            let output_path = match output_path_for_input(
+                input_root,
+                img_path,
+                output_dir,
+                &output_name,
+                options.recursive,
+            ) {
+                Ok(path) => path,
+                Err(e) => {
+                    return FileResult::Error {
+                        filename,
+                        message: e,
+                    }
+                }
+            };
+            let word_count = caption.split_whitespace().count();
+            match std::fs::write(&output_path, &caption) {
+                Ok(_) => FileResult::Captioned {
+                    filename,
+                    original_count: original_tags.len(),
+                    word_count,
+                    elapsed_ms,
+                },
+                Err(e) => FileResult::Error {
+                    filename,
+                    message: format!("写入失败: {}", e),
+                },
+            }
+        }
+        Ok(RefineOutput::Tags {
+            tags: refined_tags,
+            nl,
+            buckets,
+        }) => {
             let elapsed_ms = start.elapsed().as_millis();
             let original_count = original_tags.len();
             let refined_count = refined_tags.len();
@@ -1068,7 +1155,7 @@ async fn refine_tags_with_llm(
     tags: &[String],
     options: &TagRefineOptions,
     last_req_time: &tokio::sync::Mutex<Option<std::time::Instant>>,
-) -> Result<(Vec<String>, Option<String>, TagBuckets), String> {
+) -> Result<RefineOutput, String> {
     // 读取并缩放图片
     let max_side = if options.image_size > 0 {
         options.image_size
@@ -1219,7 +1306,21 @@ async fn refine_tags_with_llm(
         return Err("API 返回空内容".to_string());
     };
 
-    parse_refine_response(&final_content, tags)
+    // 自然语言打标：回复整段就是标签文件内容，不进标签解析
+    if options.caption_mode {
+        let caption = final_content.trim();
+        if caption.is_empty() {
+            return Err("AI 返回空描述".to_string());
+        }
+        if crate::commands::looks_like_refusal(caption) {
+            let excerpt: String = caption.chars().take(80).collect();
+            return Err(format!("LLM 拒绝处理该图片（疑似内容安全审核）: {}", excerpt));
+        }
+        return Ok(RefineOutput::Caption(caption.to_string()));
+    }
+
+    let (tags, nl, buckets) = parse_refine_response(&final_content, tags)?;
+    Ok(RefineOutput::Tags { tags, nl, buckets })
 }
 
 /// 把 LLM 的原始回复解析成 (最终标签, nl, 字段归属)。

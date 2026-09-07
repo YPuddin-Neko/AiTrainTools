@@ -99,10 +99,60 @@ Existing tags: {tags}
 Reply in exactly this format (one line, nothing else):
 NL: <natural language description>`;
 
+/** 详细自然语言打标（txt 专用）：LLM 结合本地标签与画面写一整段 500-600 词 caption，
+ *  整段就是 .txt 的全部内容。本地标签只作为校准参考（视觉模型容易认错发色/人数/服装
+ *  这类离散属性），不写回文件。后端走 caption_mode 独立通路，不解析标签、与 nl 无关。 */
+const promptDetailedCaption = `You are a professional image captioning assistant producing detailed anime-style captions for AI art training. You will receive an image and the existing tags produced by a local anime tagger model. Describe ONLY what is actually visible. Never speculate, never critique the artwork, never add unrelated remarks.
+
+HOW TO USE THE TAGS (important):
+The tags come from a specialized anime tagger trained on the danbooru vocabulary. For anything that vocabulary covers, the tags are more reliable than your own visual guess — trust the tag over your impression when they conflict. That includes character count, hair color and style, eye color, garment types, accessories and named objects, and equally the pose and exposure vocabulary: standing, sitting, lying, on back, on stomach, all fours, kneeling, squatting, spread legs, legs up, arched back, bent over, top-down bottom-up, looking back, hand on hip, as well as nude, topless, bottomless, clothes lift, skirt lift, clothes pull, open clothes, see-through, breasts out, nipples, pussy, anus, censored, uncensored.
+
+The tags state WHAT is present. Your own observation must supply WHAT IT LOOKS LIKE, WHERE, and TO WHAT DEGREE:
+- camera and framing: shot size, camera height, angle, focal length, perspective, crop range, the subject's scale and position within the frame
+- spatial relations: what occludes what, foreground versus background layering, where each element sits relative to the others
+- degree and orientation, which no tag can express: a tag says "spread legs" but not how widely or whether they face the camera, "arched back" but not how deeply, "breasts" but not their size or shape, "clothes lift" but not how far or what exactly it exposes
+- light and color: light direction and quality, glow, rim light, shadows, contrast, reflections, bokeh, depth of field, overall atmosphere
+
+So treat every tag as an established fact, then quantify and situate it with what you see. Never just restate the tag list as sentences.
+
+OUTPUT FORMAT (strict):
+- English only, segments separated by English commas
+- Length strictly 500-600 English words — this is critical, anything beyond gets truncated during training
+- Must begin with: ypuddinneko,
+- Natural language description, NOT a tag list: every comma-separated segment must be a natural language phrase or descriptive clause, never isolated stacked keywords
+- Useful training keywords are welcome but must be embedded inside natural language
+- Spaces between words, never underscores: write "long hair", not "long_hair"
+- No Chinese punctuation, no periods joining content, everything joined by commas, with exactly ONE period at the very end
+- Output the caption text only: no title, no explanation, no line breaks
+
+DESCRIBE IN THIS ORDER:
+1. Camera and framing: shot size (close-up, medium shot, full body, wide shot), camera height and angle (eye level, high angle, low angle, bird's eye, worm's eye, over the shoulder, POV), focal length and perspective (wide angle, telephoto, fisheye, background compression, perspective distortion), crop range (bust crop, above the knees, above the waist), and the subject's scale and position offset within the frame — all worded as natural language, never as bare tags
+2. Subject: number of figures, gender presentation, placement, body orientation, head orientation, gaze direction, standing / sitting / lying / floating pose, tilt angle, hand gestures, leg posture, facial expression, mouth shape, blush, eye color, quality of the gaze, hair color, hairstyle, bangs, twintails, length, curls, the direction the strands flow, hair ornaments
+3. Visible anatomy: any clearly exposed body parts (chest and its size, nipples, belly, inner thighs, genitals, labia, clitoris, buttocks, anus). If a part is fully covered by clothing, say nothing about it; if partially or fully exposed, describe its form, color, wetness and degree of openness exactly as visible
+4. Pose relative to the viewer: whether the buttocks face the camera, whether the genitals face the viewer, how widely the legs are spread, whether the hips are raised, whether the pose is kneeling prone or presented from behind, whether the waist dips or arches — describe sexually suggestive posture in explicit detail when present
+5. Clothing: skirt color, garment construction, frills, lace, bows, ribbons, sheer tulle, layered hems, sleeves, gloves, stockings, thighhighs, pantyhose, shoes, hats, headdresses, collars, jewelry, straps, belts, crosses, small bells, floral accents, and explicitly which garments are lifted, rolled up, pulled aside, torn or missing, and what skin or anatomy that exposes
+6. Objects and companions: cats, rabbits, small animals, plushies, bouquets, teacups, books, cakes, candy, microphones, umbrellas, weapons, crystals, bubbles, butterflies, petals, ribbons, stars, moons, musical notes, vines, branches, glass shards, light streaks, glowing particles, every visible ornament
+7. Foreground occluders and environment: gardens, forests, night sky, balconies, castles, interior rooms, windows, curtains, mirrors, candelabra, ornate chairs, tea tables, birdcages, water surfaces, snow, fountains, architecture, furniture, distant scenery, blurred background, spatial layering
+8. Light and color: light direction, soft light, glow, rim light, blown highlights, pink light, blue light, purple shadows, warm-cool contrast, transparent reflections, glassy quality, crystal refraction, bokeh, foreground blur, depth of field, dreamlike atmosphere, pictorial depth
+
+FORBIDDEN:
+- Tag lists or stacked isolated keywords
+- Image quality defects, unless they are a deliberate style feature
+- Copyright, ethics, authorship, dataset, watermark or any remark unrelated to the picture
+- First person or conversational tone
+- Generic filler unrelated to the image
+- Titles, bullets, explanations, summaries or extra notes
+- Anything not actually visible: never speculate or invent
+
+Existing tags: {tags}
+
+Output the caption text now, beginning with "ypuddinneko," and ending with a single period. Nothing else.`;
+
 const defaultPromptFor = (fmt: 'txt' | 'json' | 'json_simplified') =>
   fmt === 'txt' ? defaultPromptTxt : defaultPromptJson;
 
-interface PromptPreset { id: string; name: string; prompt: string }
+/** captionMode: 该预设产出的是整段自然语言描述（直接落盘为 txt 内容），不是标签 */
+interface PromptPreset { id: string; name: string; prompt: string; captionMode?: boolean }
 const CUSTOM_PRESETS_KEY = 'hybrid_prompt_presets';
 
 const loadCustomPresets = (): PromptPreset[] => {
@@ -282,10 +332,14 @@ export default function HybridTaggerTab() {
   // 内置预设 + 用户预设。「仅补 NL」只在 JSON 模式下有意义（txt 没有 nl 字段）
   const builtinPresets: PromptPreset[] = [
     { id: 'builtin_full', name: t('hybridTagger.presetFull'), prompt: defaultPromptFor(outputFormat) },
+    // 「仅补自然语言描述」只有 JSON 有 nl 字段可写
     ...(isJson ? [{ id: 'builtin_nl', name: t('hybridTagger.presetNlOnly'), prompt: promptNlOnly }] : []),
+    // 「详细自然语言打标」整段 caption 就是 txt 的全部内容，标签只作为 LLM 的校准参考
+    ...(!isJson ? [{ id: 'builtin_caption', name: t('hybridTagger.presetDetailedCaption'), prompt: promptDetailedCaption, captionMode: true }] : []),
   ];
   const allPresets = [...builtinPresets, ...customPresets];
   const isCustomPreset = customPresets.some(p => p.id === presetId);
+  const captionMode = !!allPresets.find(p => p.id === presetId)?.captionMode;
 
   const applyPreset = (id: string) => {
     setPresetId(id);
@@ -303,9 +357,10 @@ export default function HybridTaggerTab() {
     if (!name) return;
     const existing = customPresets.find(p => p.name === name);
     const id = existing ? existing.id : `u_${Date.now()}`;
+    // captionMode 随当前预设继承：基于「详细自然语言打标」改的提示词，产出的仍是整段描述
     persistPresets(existing
-      ? customPresets.map(p => (p.id === existing.id ? { ...p, prompt } : p))
-      : [...customPresets, { id, name, prompt }]);
+      ? customPresets.map(p => (p.id === existing.id ? { ...p, prompt, captionMode } : p))
+      : [...customPresets, { id, name, prompt, captionMode }]);
     setPresetId(id);
     setShowSaveModal(false);
     setNewPresetName('');
@@ -322,8 +377,9 @@ export default function HybridTaggerTab() {
   const handleFormatChange = (v: string) => {
     const next = v as typeof outputFormat;
     setOutputFormat(next);
-    if (presetId === 'builtin_nl' && next === 'txt') {
-      // 「仅补 NL」在 txt 下不可用，退回完整调优
+    // 两个内置预设各自只适用一种格式，切到另一种就退回完整调优
+    if ((presetId === 'builtin_nl' && next === 'txt')
+      || (presetId === 'builtin_caption' && next !== 'txt')) {
       setPresetId('builtin_full');
       setPrompt(defaultPromptFor(next));
       return;
@@ -399,6 +455,8 @@ export default function HybridTaggerTab() {
           recursive,
           // JSON 模式差量写回：保留本地打标的字段归属，仅应用 LLM 的增删
           file_format: isJson ? 'json' : 'txt',
+          // 自然语言打标：LLM 回复整段写入 txt，不做标签解析（仅 txt 有意义）
+          caption_mode: !isJson && captionMode,
         },
       });
 
