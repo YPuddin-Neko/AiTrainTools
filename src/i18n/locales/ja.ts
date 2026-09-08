@@ -701,6 +701,7 @@ const ja = {
     llmPhase: 'LLM 調整',
     presetFull: 'タグ調整 + 自然言語説明',
     presetTagsOnly: 'タグ調整',
+    triggerWord: 'トリガーワード',
     presetNlOnly: '自然言語説明のみ',
     presetDetailedCaption: '詳細な自然言語キャプション',
     savePreset: 'プリセットとして保存',

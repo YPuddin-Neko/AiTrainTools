@@ -3,7 +3,7 @@ import { invoke } from '@tauri-apps/api/core';
 import { listen } from '../utils/tauriRuntime';
 import {
   Key, Bot, RefreshCw, Loader2, Eye, EyeOff, Save, Thermometer, Image as ImageIcon,
-  Check, Cpu, Gpu, Trash2, Focus,
+  Check, Cpu, Gpu, Trash2, Focus, Hash,
 } from 'lucide-react';
 import { Modal } from './Modal';
 import ProgressLog, { getTimeStr, useLogState } from './ProgressLog';
@@ -118,7 +118,7 @@ So treat every tag as an established fact, then quantify and situate it with wha
 OUTPUT FORMAT (strict):
 - English only, segments separated by English commas
 - Length strictly 500-600 English words — this is critical, anything beyond gets truncated during training
-- Must begin with: ypuddinneko,
+- Must begin with: {trigger},
 - Natural language description, NOT a tag list: every comma-separated segment must be a natural language phrase or descriptive clause, never isolated stacked keywords
 - Useful training keywords are welcome but must be embedded inside natural language
 - Spaces between words, never underscores: write "long hair", not "long_hair"
@@ -146,13 +146,23 @@ FORBIDDEN:
 
 Existing tags: {tags}
 
-Output the caption text now, beginning with "ypuddinneko," and ending with a single period. Nothing else.`;
+Output the caption text now, beginning with "{trigger}," and ending with a single period. Nothing else.`;
 
 const defaultPromptFor = (fmt: 'txt' | 'json' | 'json_simplified') =>
   fmt === 'txt' ? defaultPromptTxt : defaultPromptJson;
 
 /** captionMode: 该预设产出的是整段自然语言描述（直接落盘为 txt 内容），不是标签 */
 interface PromptPreset { id: string; name: string; prompt: string; captionMode?: boolean }
+
+const TRIGGER_WORD_KEY = 'hybrid_trigger_word';
+
+/** 把提示词里的 {trigger} 换成实际触发词。
+ *  触发词为空时整行删掉——否则会给模型留下 `beginning with ","` 这种残句。 */
+const applyTriggerWord = (prompt: string, trigger: string): string => {
+  const t = trigger.trim();
+  if (t) return prompt.split('{trigger}').join(t);
+  return prompt.split('\n').filter(l => !l.includes('{trigger}')).join('\n');
+};
 const CUSTOM_PRESETS_KEY = 'hybrid_prompt_presets';
 
 const loadCustomPresets = (): PromptPreset[] => {
@@ -208,6 +218,10 @@ export default function HybridTaggerTab() {
   const [customPresets, setCustomPresets] = useState<PromptPreset[]>(loadCustomPresets);
   const [showSaveModal, setShowSaveModal] = useState(false);
   const [newPresetName, setNewPresetName] = useState('');
+  // 触发词按项目变，不写死在预设里；提示词用 {trigger} 占位
+  const [triggerWord, setTriggerWord] = useState(() => {
+    try { return localStorage.getItem(TRIGGER_WORD_KEY) || ''; } catch { return ''; }
+  });
   const [temperature, setTemperature] = useState('0.3');
   const [topP, setTopP] = useState('0');
   const [imageSize, setImageSize] = useState('1024');
@@ -449,7 +463,7 @@ export default function HybridTaggerTab() {
           api_endpoint: endpoint,
           api_key: apiKey,
           model_name: modelName,
-          prompt,
+          prompt: applyTriggerWord(prompt, triggerWord),
           temperature: Number.isFinite(parseFloat(temperature)) ? parseFloat(temperature) : 0.3,
           max_tokens: -1,
           image_size: parseInt(imageSize) || 1024,
@@ -695,21 +709,33 @@ export default function HybridTaggerTab() {
                 <input className="form-input" type="number" step="0.1" value={intervalSec} onChange={e => setIntervalSec(e.target.value)} />
               </div>
             </div>
-            <div>
-              <label className="form-label" style={{ display: 'flex', alignItems: 'center', gap: 4 }}><Focus style={{ width: 12, height: 12, color: 'var(--color-text-tertiary)' }} /> {t('tagRefine.imageDetail')}</label>
-              <CustomSelect value={imageDetail} onChange={setImageDetail} options={IMAGE_DETAIL_OPTIONS(t)} />
+            <div style={{ display: 'flex', gap: 'var(--space-2)' }}>
+              <div style={{ flex: 1, minWidth: 0 }}>
+                <label className="form-label" style={{ display: 'flex', alignItems: 'center', gap: 4 }}><Focus style={{ width: 12, height: 12, color: 'var(--color-text-tertiary)' }} /> {t('tagRefine.imageDetail')}</label>
+                <CustomSelect value={imageDetail} onChange={setImageDetail} options={IMAGE_DETAIL_OPTIONS(t)} />
+              </div>
+              <div style={{ flex: 1, minWidth: 0 }}>
+                <label className="form-label">{t('hybridTagger.outputFormat')}</label>
+                <CustomSelect
+                  value={outputFormat}
+                  onChange={handleFormatChange}
+                  options={[
+                    { value: 'txt', label: t('hybridTagger.formatTxt') },
+                    { value: 'json', label: t('hybridTagger.formatJson') },
+                    { value: 'json_simplified', label: t('hybridTagger.formatJsonSimplified') },
+                  ]}
+                />
+              </div>
             </div>
             <div>
-              <label className="form-label">{t('hybridTagger.outputFormat')}</label>
-              <CustomSelect
-                value={outputFormat}
-                onChange={handleFormatChange}
-                options={[
-                  { value: 'txt', label: t('hybridTagger.formatTxt') },
-                  { value: 'json', label: t('hybridTagger.formatJson') },
-                  { value: 'json_simplified', label: t('hybridTagger.formatJsonSimplified') },
-                ]}
-              />
+              <label className="form-label" style={{ display: 'flex', alignItems: 'center', gap: 4 }}>
+                <Hash style={{ width: 12, height: 12, color: 'var(--color-text-tertiary)' }} /> {t('hybridTagger.triggerWord')}
+              </label>
+              <input className="form-input" value={triggerWord}
+                onChange={e => {
+                  setTriggerWord(e.target.value);
+                  try { localStorage.setItem(TRIGGER_WORD_KEY, e.target.value); } catch { /* 配额满等，忽略 */ }
+                }} />
             </div>
           </div>
         </div>

@@ -730,6 +730,7 @@ const zhCN = {
     llmPhase: 'LLM 调优',
     presetFull: '标签调优 + 自然语言描述',
     presetTagsOnly: '标签调优',
+    triggerWord: '触发词',
     presetNlOnly: '仅补自然语言描述',
     presetDetailedCaption: '详细自然语言打标',
     savePreset: '保存为预设',

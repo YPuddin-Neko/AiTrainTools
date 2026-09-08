@@ -701,6 +701,7 @@ const en = {
     llmPhase: 'LLM Refinement',
     presetFull: 'Refine tags + description',
     presetTagsOnly: 'Refine tags',
+    triggerWord: 'Trigger word',
     presetNlOnly: 'Description only',
     presetDetailedCaption: 'Detailed caption',
     savePreset: 'Save as preset',
