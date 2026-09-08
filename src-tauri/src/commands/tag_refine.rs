@@ -43,6 +43,10 @@ pub struct TagRefineOptions {
     /// 与 JSON 的 nl 字段无关——JSON 路径完全不走这里
     #[serde(default)]
     pub caption_mode: bool,
+    /// LoRA 触发词。txt 无论标签还是自然语言都强制置于最前；JSON 追加进 artist 字段。
+    /// 由后端保证，不依赖 LLM 遵守提示词
+    #[serde(default)]
+    pub trigger_word: String,
 }
 
 fn default_file_format() -> String {
@@ -487,6 +491,8 @@ struct JsonTagLayout {
     /// 这几个是本地打标器靠关键词表猜出来的分类（"simple background" 之类经常落错格），
     /// 其余字段来自 tagger 的模型 category 或路径，属于事实信息，不交给 LLM 动
     bucket_paths: [&'static [&'static str]; 4],
+    /// 触发词写入的位置：画师/风格字段
+    artist_path: &'static [&'static str],
 }
 
 const FULL_LAYOUT: JsonTagLayout = JsonTagLayout {
@@ -506,6 +512,7 @@ const FULL_LAYOUT: JsonTagLayout = JsonTagLayout {
     ],
     added_to: &["ai_output", "tags"],
     nl_path: &["ai_output", "nl"],
+    artist_path: &["fixed", "artist"],
     bucket_paths: [
         &["ai_output", "count"],
         &["ai_output", "appearance"],
@@ -519,6 +526,7 @@ const SIMPLIFIED_LAYOUT: JsonTagLayout = JsonTagLayout {
     array_fields: &[&["appearance"], &["tags"], &["environment"]],
     added_to: &["tags"],
     nl_path: &["nl"],
+    artist_path: &["artist"],
     bucket_paths: [&["count"], &["appearance"], &["tags"], &["environment"]],
 };
 
@@ -830,6 +838,58 @@ fn apply_buckets_to_json(data: &mut serde_json::Value, buckets: &TagBuckets, ref
     );
 }
 
+/// txt 内容强制以触发词开头（标签列表和自然语言描述一视同仁）。
+/// 幂等：LLM 自己已经按提示词带上了就不重复插入。
+fn ensure_trigger_prefix(content: &str, trigger: &str) -> String {
+    let t = trigger.trim();
+    if t.is_empty() {
+        return content.to_string();
+    }
+    let head = content.trim_start();
+    if head.is_empty() {
+        return t.to_string();
+    }
+    // 用 char 边界安全的前缀比较；触发词后面必须是逗号或空白，避免 "ypuddin" 命中 "ypuddinneko"
+    if let Some(prefix) = head.get(..t.len()) {
+        if prefix.eq_ignore_ascii_case(t) {
+            let rest = &head[t.len()..];
+            if rest.is_empty()
+                || rest.starts_with(',')
+                || rest.starts_with('，')
+                || rest.starts_with(char::is_whitespace)
+            {
+                return head.to_string();
+            }
+        }
+    }
+    format!("{}, {}", t, head)
+}
+
+/// 触发词写入 JSON 的 artist 字段（完整格式 fixed.artist / 简化格式 artist），
+/// 放在最前面并保留原有画师标签；已存在则不重复添加。
+fn set_json_trigger(data: &mut serde_json::Value, trigger: &str) {
+    let t = trigger.trim();
+    if t.is_empty() {
+        return;
+    }
+    let path = json_layout(data).artist_path;
+    let existing: Vec<String> = json_get_path(data, path)
+        .and_then(|v| v.as_str())
+        .map(|s| {
+            s.split(',')
+                .map(|x| x.trim().to_string())
+                .filter(|x| !x.is_empty())
+                .collect()
+        })
+        .unwrap_or_default();
+    if existing.iter().any(|p| p.eq_ignore_ascii_case(t)) {
+        return;
+    }
+    let mut merged = vec![t.to_string()];
+    merged.extend(existing);
+    json_set_path(data, path, serde_json::Value::String(merged.join(", ")));
+}
+
 /// 将 LLM 返回的自然语言描述写入 JSON 的 nl 字段（完整格式 ai_output.nl / 简化格式 nl）。
 /// 本地打标器不产生 nl，该字段由此补充；路径缺失时逐级补建。
 fn set_json_nl(data: &mut serde_json::Value, nl: &str) {
@@ -1029,6 +1089,8 @@ async fn process_single_file(
                     }
                 }
             };
+            // 触发词由后端保证在最前，不依赖 LLM 遵守提示词
+            let caption = ensure_trigger_prefix(&caption, &options.trigger_word);
             let word_count = caption.split_whitespace().count();
             match std::fs::write(&output_path, &caption) {
                 Ok(_) => FileResult::Captioned {
@@ -1113,6 +1175,8 @@ async fn process_single_file(
                 if let Some(nl_text) = nl.as_deref() {
                     set_json_nl(&mut data, nl_text);
                 }
+                // 触发词进 artist 字段（JSON 的触发词位置），txt 那边则是置于开头
+                set_json_trigger(&mut data, &options.trigger_word);
                 match serde_json::to_string_pretty(&data) {
                     Ok(s) => s,
                     Err(e) => {
@@ -1123,7 +1187,8 @@ async fn process_single_file(
                     }
                 }
             } else {
-                refined_tags.join(", ")
+                // 纯标签的 txt 同样要以触发词开头
+                ensure_trigger_prefix(&refined_tags.join(", "), &options.trigger_word)
             };
             match std::fs::write(&output_path, &output_content) {
                 Ok(_) => FileResult::Success {
@@ -1493,6 +1558,62 @@ mod marker_tests {
         assert!(parse_refine_response("Sorry, I cannot help.", &[]).is_err());
         // 普通单行仍按标签处理
         assert!(parse_refine_response("1girl, solo", &[]).is_ok());
+    }
+
+    /// 触发词：txt 强制置于开头，且不能重复插入（caption 提示词也会要求 LLM 自己带上）
+    #[test]
+    fn trigger_prefix_is_forced_and_idempotent() {
+        // 标签列表
+        assert_eq!(
+            ensure_trigger_prefix("1girl, solo", "ypuddinneko"),
+            "ypuddinneko, 1girl, solo"
+        );
+        // LLM 已经带上了就不重复
+        assert_eq!(
+            ensure_trigger_prefix("ypuddinneko, 1girl, solo", "ypuddinneko"),
+            "ypuddinneko, 1girl, solo"
+        );
+        // 大小写不敏感
+        assert_eq!(
+            ensure_trigger_prefix("YPuddinNeko, 1girl", "ypuddinneko"),
+            "YPuddinNeko, 1girl"
+        );
+        // 前缀相同但不是同一个词，必须补
+        assert_eq!(
+            ensure_trigger_prefix("ypuddin, 1girl", "ypuddinneko"),
+            "ypuddinneko, ypuddin, 1girl"
+        );
+        // 触发词为空时原样返回
+        assert_eq!(ensure_trigger_prefix("1girl, solo", "  "), "1girl, solo");
+        // 多字节内容不会在 char 边界上 panic
+        assert_eq!(
+            ensure_trigger_prefix("少女, 微笑", "触发词"),
+            "触发词, 少女, 微笑"
+        );
+    }
+
+    /// 触发词：JSON 进 artist 字段，放最前且保留原有画师标签
+    #[test]
+    fn trigger_goes_into_artist_field() {
+        // 完整格式，artist 为空
+        let mut full = serde_json::json!({"fixed": {"artist": ""}, "ai_output": {"tags": []}});
+        set_json_trigger(&mut full, "ypuddinneko");
+        assert_eq!(full["fixed"]["artist"], "ypuddinneko");
+        // 已有画师标签：触发词插到最前，原值保留
+        let mut kept = serde_json::json!({"fixed": {"artist": "@wlop"}, "ai_output": {}});
+        set_json_trigger(&mut kept, "ypuddinneko");
+        assert_eq!(kept["fixed"]["artist"], "ypuddinneko, @wlop");
+        // 幂等
+        set_json_trigger(&mut kept, "ypuddinneko");
+        assert_eq!(kept["fixed"]["artist"], "ypuddinneko, @wlop");
+        // 简化格式写顶层 artist
+        let mut simp = serde_json::json!({"artist": "", "tags": [], "character": ""});
+        set_json_trigger(&mut simp, "ypuddinneko");
+        assert_eq!(simp["artist"], "ypuddinneko");
+        // 空触发词不动
+        let mut untouched = serde_json::json!({"fixed": {"artist": "@wlop"}, "ai_output": {}});
+        set_json_trigger(&mut untouched, "");
+        assert_eq!(untouched["fixed"]["artist"], "@wlop");
     }
 
     /// 安全审核拒绝：必须判失败，绝不能把拒绝语当成标签写进标签文件

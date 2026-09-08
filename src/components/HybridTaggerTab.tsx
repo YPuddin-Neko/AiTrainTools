@@ -476,6 +476,8 @@ export default function HybridTaggerTab() {
           file_format: isJson ? 'json' : 'txt',
           // 自然语言打标：LLM 回复整段写入 txt，不做标签解析（仅 txt 有意义）
           caption_mode: !isJson && captionMode,
+          // 触发词：txt 强制置于开头（标签/自然语言都是），JSON 追加进 artist 字段
+          trigger_word: triggerWord,
         },
       });
 
