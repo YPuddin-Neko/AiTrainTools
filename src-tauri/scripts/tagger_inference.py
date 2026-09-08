@@ -477,6 +477,7 @@ def run_convert_mode():
     parser.add_argument("--simplified", action="store_true")
     parser.add_argument("--remove-txt", action="store_true")
     parser.add_argument("--recursive", action="store_true")
+    parser.add_argument("--overwrite", action="store_true")
     args = parser.parse_args()
 
     if args.tags_path.endswith(".json"):
@@ -503,7 +504,11 @@ def run_convert_mode():
     failed = 0
     for i, img in enumerate(images):
         txt = img.parent / f"{img.stem}.txt"
+        json_path = img.parent / f"{img.stem}.json"
         if not txt.exists():
+            skipped += 1
+        elif json_path.exists() and not args.overwrite:
+            # 已有 JSON 就不拿 txt 盖掉：那份 JSON 可能已经有正确的字段归属和 nl
             skipped += 1
         else:
             try:
@@ -519,7 +524,6 @@ def run_convert_mode():
                     cat = cat_by_name.get(_normalize_tag_key(plain), "general")
                     selected.append((plain, cat))
                 data = _build_simplified_json(selected) if args.simplified else _build_structured_json(selected)
-                json_path = img.parent / f"{img.stem}.json"
                 _write_json_atomic(json_path, data)
                 if args.remove_txt:
                     txt.unlink()

@@ -524,6 +524,11 @@ pub struct ConvertTagsOptions {
     pub remove_txt: bool,
     #[serde(default)]
     pub recursive: bool,
+    /// 已存在同名 .json 时是否用 txt 覆盖它。默认 false（跳过）——
+    /// 已有的 JSON 可能是跑过 LLM 调优、带 nl 和正确字段归属的成果，
+    /// 拿一份扁平 txt 盖掉就白跑了
+    #[serde(default)]
+    pub overwrite_existing: bool,
 }
 
 /// 将图片旁的 .txt 标签按模型词表分类后转换为 JSON。
@@ -533,15 +538,60 @@ pub async fn convert_tags_to_json(
     app: tauri::AppHandle,
     options: ConvertTagsOptions,
 ) -> Result<ProcessResult, String> {
+    // 与打标共用取消标志：进来先清掉上一轮的残留，否则会立刻自我中断
+    inference::reset_tagging_cancel();
+
     let model_def = models::find_model(&options.model_id)
         .ok_or_else(|| format!("模型不存在: {}", options.model_id))?;
-    let tags_path = get_model_dir(&model_def.id).join(model_def.tags_basename());
+
+    // 模型缺文件就整包下载，和打标一致：只下词表会留下"词表有模型没有"的
+    // 半吊子状态，本地打标照样跑不了。下载失败直接结束任务
+    let model_dir = get_model_dir(&model_def.id);
+    let is_model_ready = model_def
+        .required_local_files()
+        .iter()
+        .all(|filename| model_dir.join(filename).exists());
+    if !is_model_ready {
+        use tauri::Emitter;
+        let _ = app.emit(
+            "tagger-progress",
+            ProgressEvent {
+                current: 0,
+                total: 0,
+                filename: String::new(),
+                status: "info".to_string(),
+                message: format!("模型 {} 未下载，开始下载...", model_def.name),
+                ..Default::default()
+            },
+        );
+        download::download_model(&app, &model_def).await?;
+        if inference::is_tagging_cancelled() {
+            return Err("已取消".into());
+        }
+    }
+
+    let tags_path = model_dir.join(model_def.tags_basename());
     if !tags_path.exists() {
-        return Err(format!("模型词表未下载: {}", tags_path.display()));
+        return Err(format!(
+            "模型词表下载后仍不存在: {}",
+            tags_path.display()
+        ));
     }
     tokio::task::spawn_blocking(move || run_convert_tags(&app, &options, &tags_path))
         .await
         .map_err(|e| format!("转换任务执行失败: {}", e))?
+}
+
+/// 只留 stderr 的尾部若干行：Python 的关键异常信息在最后，
+/// 整段 traceback 灌进错误提示没法看
+fn tail_of_stderr(lines: &[String]) -> String {
+    let kept: Vec<&str> = lines
+        .iter()
+        .map(|l| l.trim())
+        .filter(|l| !l.is_empty())
+        .collect();
+    let start = kept.len().saturating_sub(4);
+    kept[start..].join(" | ")
 }
 
 fn run_convert_tags(
@@ -564,7 +614,7 @@ fn run_convert_tags(
         .arg(tags_path)
         .stdin(std::process::Stdio::null())
         .stdout(std::process::Stdio::piped())
-        .stderr(std::process::Stdio::null())
+        .stderr(std::process::Stdio::piped())
         .env("PYTHONUNBUFFERED", "1")
         .env("PYTHONIOENCODING", "utf-8");
     if options.json_simplified {
@@ -576,18 +626,36 @@ fn run_convert_tags(
     if options.recursive {
         cmd.arg("--recursive");
     }
+    if options.overwrite_existing {
+        cmd.arg("--overwrite");
+    }
     crate::commands::python_proc::configure_python_command(&mut cmd, false);
 
     let mut child = cmd
         .spawn()
         .map_err(|e| format!("启动转换进程失败: {}", e))?;
     let stdout = child.stdout.take().ok_or("无法获取转换进程输出")?;
+    // stderr 必须另起线程并发读走：piped 之后不读，缓冲区一满 Python 就阻塞在写日志上。
+    // 之前这里是 Stdio::null()，Python 崩了只能得到一句"异常退出"，看不到原因
+    let stderr_reader = child.stderr.take().map(|se| {
+        std::thread::spawn(move || {
+            std::io::BufReader::new(se)
+                .lines()
+                .map_while(Result::ok)
+                .collect::<Vec<String>>()
+        })
+    });
+    // 登记到全局句柄，取消时 kill_python_process 才杀得到它
+    inference::register_python_process(child);
 
     let mut converted = 0u32;
     let mut failed = 0u32;
     let mut skipped = 0u32;
     let mut total = 0u32;
     for line in std::io::BufReader::new(stdout).lines().map_while(Result::ok) {
+        if inference::is_tagging_cancelled() {
+            break;
+        }
         let Ok(msg) = serde_json::from_str::<serde_json::Value>(&line) else {
             continue;
         };
@@ -642,15 +710,35 @@ fn run_convert_tags(
                     .and_then(|v| v.as_str())
                     .unwrap_or("转换失败")
                     .to_string();
-                let _ = child.wait();
+                if let Some(mut c) = inference::take_python_process() {
+                    let _ = c.wait();
+                }
                 return Err(message);
             }
             _ => {}
         }
     }
-    let status = child.wait().map_err(|e| format!("等待转换进程失败: {}", e))?;
-    if !status.success() && converted == 0 {
-        return Err("转换进程异常退出".to_string());
+    let stderr_tail = stderr_reader
+        .and_then(|h| h.join().ok())
+        .map(|lines| tail_of_stderr(&lines))
+        .unwrap_or_default();
+
+    // 取回句柄回收；取消路径下进程已被 kill_python_process 杀掉并取走，这里为 None
+    match inference::take_python_process() {
+        Some(mut c) => {
+            let status = c.wait().map_err(|e| format!("等待转换进程失败: {}", e))?;
+            if !status.success() && converted == 0 {
+                return Err(if stderr_tail.is_empty() {
+                    "转换进程异常退出".to_string()
+                } else {
+                    format!("转换进程异常退出: {}", stderr_tail)
+                });
+            }
+        }
+        None => return Err("已取消".to_string()),
+    }
+    if inference::is_tagging_cancelled() {
+        return Err("已取消".to_string());
     }
 
     let _ = app.emit(

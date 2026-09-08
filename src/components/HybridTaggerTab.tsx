@@ -20,7 +20,7 @@ interface ModelInfo { id: string; name: string; description: string; input_size:
 interface ProcessResult { success_count: number; fail_count: number; total: number; errors: string[]; }
 interface ProgressPayload { current: number; total: number; filename: string; status: string; message: string; i18n_key?: string; i18n_params?: Record<string, string>; }
 
-type Phase = '' | 'tagging' | 'refining';
+type Phase = '' | 'converting' | 'tagging' | 'refining';
 
 /** 默认调优提示词（TXT 模式）：补充缺失 / 删除错误 / 修复不准确（{tags} 由后端替换为该图现有标签） */
 const defaultPromptTxt = `You are an expert anime image tagger. You will receive an image and its existing tags produced by a local tagger model.
@@ -99,6 +99,38 @@ Existing tags: {tags}
 Reply in exactly this format (one line, nothing else):
 NL: <natural language description>`;
 
+/** 归类字段 + 补描述（JSON 专用）：给已经打好标的数据集用——
+ *  LLM 只决定每个标签属于哪个字段并补 nl，标签集合一个不增不减。
+ *  后端走 preserve_tags 保证集合恒定，不指望模型遵守"不要增删"的嘱咐。 */
+const promptSortOnly = `You are an expert anime image tagger. You will receive an image and its existing tags, already produced by a local tagger.
+
+Your task is ONLY to put each given tag into the correct category, and to write a natural language description. You must NOT change the tag set itself.
+
+Rules:
+- Use every tag you are given, exactly as written — do not reword, merge or split them
+- Do NOT add any tag that is not in the list, even if you can see something untagged in the image
+- Do NOT remove any tag, even if you believe it does not match the image
+- Every tag must appear in exactly one category
+- Leave a category line empty if nothing belongs to it
+- Character names, series names, artist names and quality tags are handled separately, they are not in your list
+
+Categories:
+- COUNT: character count only, e.g. 1girl, 2boys, 1girl 1boy, no humans
+- APPEARANCE: the character's visual features - hair color, hairstyle, eye color, clothing, accessories
+- TAGS: actions, expressions, poses, composition, objects held or used, e.g. smile, standing, looking at viewer, upper body
+- ENVIRONMENT: background, location, lighting, atmosphere, e.g. simple background, white background, outdoors, classroom, night, sunlight
+
+Then write a natural language description (1-2 sentences) of the image, consistent with the image content and the tags.
+
+Existing tags: {tags}
+
+Reply in exactly this format (five lines, nothing else):
+COUNT: <comma-separated>
+APPEARANCE: <comma-separated>
+TAGS: <comma-separated>
+ENVIRONMENT: <comma-separated>
+NL: <natural language description>`;
+
 /** 详细自然语言打标（txt 专用）：LLM 结合本地标签与画面写一整段 500-600 词 caption，
  *  整段就是 .txt 的全部内容。本地标签只作为校准参考（视觉模型容易认错发色/人数/服装
  *  这类离散属性），不写回文件。后端走 caption_mode 独立通路，不解析标签、与 nl 无关。 */
@@ -152,7 +184,15 @@ const defaultPromptFor = (fmt: 'txt' | 'json' | 'json_simplified') =>
   fmt === 'txt' ? defaultPromptTxt : defaultPromptJson;
 
 /** captionMode: 该预设产出的是整段自然语言描述（直接落盘为 txt 内容），不是标签 */
-interface PromptPreset { id: string; name: string; prompt: string; captionMode?: boolean }
+interface PromptPreset {
+  id: string;
+  name: string;
+  prompt: string;
+  /** 产出整段自然语言描述（直接落盘为 txt 内容），不是标签 */
+  captionMode?: boolean;
+  /** 只归类不增删：标签集合由后端保证恒定，LLM 的回复只当归属映射 */
+  preserveTags?: boolean;
+}
 
 const TRIGGER_WORD_KEY = 'hybrid_trigger_word';
 
@@ -351,14 +391,19 @@ export default function HybridTaggerTab() {
       name: isJson ? t('hybridTagger.presetFull') : t('hybridTagger.presetTagsOnly'),
       prompt: defaultPromptFor(outputFormat),
     },
-    // 「仅补自然语言描述」只有 JSON 有 nl 字段可写
-    ...(isJson ? [{ id: 'builtin_nl', name: t('hybridTagger.presetNlOnly'), prompt: promptNlOnly }] : []),
+    // 「归类字段 + 补描述」「仅补自然语言描述」都依赖 JSON 的字段结构与 nl
+    ...(isJson ? [
+      { id: 'builtin_sort', name: t('hybridTagger.presetSortOnly'), prompt: promptSortOnly, preserveTags: true },
+      { id: 'builtin_nl', name: t('hybridTagger.presetNlOnly'), prompt: promptNlOnly },
+    ] : []),
     // 「详细自然语言打标」整段 caption 就是 txt 的全部内容，标签只作为 LLM 的校准参考
     ...(!isJson ? [{ id: 'builtin_caption', name: t('hybridTagger.presetDetailedCaption'), prompt: promptDetailedCaption, captionMode: true }] : []),
   ];
   const allPresets = [...builtinPresets, ...customPresets];
   const isCustomPreset = customPresets.some(p => p.id === presetId);
-  const captionMode = !!allPresets.find(p => p.id === presetId)?.captionMode;
+  const activePreset = allPresets.find(p => p.id === presetId);
+  const captionMode = !!activePreset?.captionMode;
+  const preserveTags = !!activePreset?.preserveTags;
 
   const applyPreset = (id: string) => {
     setPresetId(id);
@@ -378,8 +423,8 @@ export default function HybridTaggerTab() {
     const id = existing ? existing.id : `u_${Date.now()}`;
     // captionMode 随当前预设继承：基于「详细自然语言打标」改的提示词，产出的仍是整段描述
     persistPresets(existing
-      ? customPresets.map(p => (p.id === existing.id ? { ...p, prompt, captionMode } : p))
-      : [...customPresets, { id, name, prompt, captionMode }]);
+      ? customPresets.map(p => (p.id === existing.id ? { ...p, prompt, captionMode, preserveTags } : p))
+      : [...customPresets, { id, name, prompt, captionMode, preserveTags }]);
     setPresetId(id);
     setShowSaveModal(false);
     setNewPresetName('');
@@ -397,7 +442,7 @@ export default function HybridTaggerTab() {
     const next = v as typeof outputFormat;
     setOutputFormat(next);
     // 两个内置预设各自只适用一种格式，切到另一种就退回完整调优
-    if ((presetId === 'builtin_nl' && next === 'txt')
+    if (((presetId === 'builtin_nl' || presetId === 'builtin_sort') && next === 'txt')
       || (presetId === 'builtin_caption' && next !== 'txt')) {
       setPresetId('builtin_full');
       setPrompt(defaultPromptFor(next));
@@ -421,6 +466,26 @@ export default function HybridTaggerTab() {
     taskLogs.setInitialLog(t('hybridTagger.phaseTagging'));
 
     try {
+      // JSON 输出 + 优先使用已有标签：先把只有 .txt 的图按模型词表转成 JSON，
+      // 这样下一步"跳过已有标签"的判定才能命中，不会丢掉手里现成的 txt 标签去重跑模型。
+      // 已经有 .json 的图会被跳过（不拿扁平 txt 盖掉带 nl 的成果）
+      if (isJson && preferExisting) {
+        setPhase('converting');
+        taskLogs.appendLog(t('hybridTagger.phaseConverting'), 'info');
+        updateTask('tagger', { status: 'running', message: t('hybridTagger.phaseConverting') });
+        await invoke<ProcessResult>('convert_tags_to_json', {
+          options: {
+            input_path: inputPath,
+            model_id: selectedModel,
+            json_simplified: outputFormat === 'json_simplified',
+            remove_txt: false,
+            recursive,
+            overwrite_existing: false,
+          },
+        });
+        if (cancelRequestedRef.current) throw '已取消';
+      }
+
       // 本地打标（直接按所选格式输出）
       setPhase('tagging');
       await invoke<ProcessResult>('start_tagging', {
@@ -478,6 +543,8 @@ export default function HybridTaggerTab() {
           caption_mode: !isJson && captionMode,
           // 触发词：txt 强制置于开头（标签/自然语言都是），JSON 追加进 artist 字段
           trigger_word: triggerWord,
+          // 只归类不增删：标签集合由后端保证恒定（仅 JSON 有字段结构）
+          preserve_tags: isJson && preserveTags,
         },
       });
 
@@ -751,7 +818,8 @@ export default function HybridTaggerTab() {
         cancelCommand={phase === 'refining' ? 'cancel_tag_refining' : 'force_cancel_tagging'}
         startText={t('hybridTagger.startText')}
         processingText={
-          phase === 'tagging' ? t('hybridTagger.phaseShortTagging')
+          phase === 'converting' ? t('hybridTagger.phaseShortConverting')
+          : phase === 'tagging' ? t('hybridTagger.phaseShortTagging')
           : phase === 'refining' ? t('hybridTagger.phaseShortRefining')
           : t('pages.processing')
         }

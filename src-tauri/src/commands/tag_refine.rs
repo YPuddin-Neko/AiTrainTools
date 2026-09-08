@@ -47,6 +47,11 @@ pub struct TagRefineOptions {
     /// 由后端保证，不依赖 LLM 遵守提示词
     #[serde(default)]
     pub trigger_word: String,
+    /// 保集合模式（仅 JSON）：LLM 只决定标签归属，不许增删。
+    /// 标签只从原字段读取，LLM 新增的丢弃、漏掉的留原地——由后端保证，
+    /// 不指望模型遵守"不要增删"的嘱咐
+    #[serde(default)]
+    pub preserve_tags: bool,
 }
 
 fn default_file_format() -> String {
@@ -838,6 +843,76 @@ fn apply_buckets_to_json(data: &mut serde_json::Value, buckets: &TagBuckets, ref
     );
 }
 
+/// 只按 LLM 的归属重排字段，标签集合保持不变（"归类字段 + 补描述"预设）。
+///
+/// 与 `apply_buckets_to_json` 的根本区别：标签**只从原有字段读取**，
+/// LLM 的回复仅提供 `标签 → 目标字段` 的映射。因此
+/// LLM 新增的标签会被丢弃、漏掉的标签留在原字段，集合恒定不变——
+/// 已经打好的标签不会因为模型少写一个词就丢失。
+/// 非重排字段（quality/series/artist/character/from_path）完全不碰。
+fn apply_buckets_preserving(data: &mut serde_json::Value, buckets: &TagBuckets) {
+    let layout = json_layout(data);
+
+    // LLM 给出的归属：标签（小写）→ bucket 下标
+    let mut assign: std::collections::HashMap<String, usize> = std::collections::HashMap::new();
+    for (i, slot) in buckets.slots().iter().enumerate() {
+        if let Some(list) = slot {
+            for t in list {
+                assign.insert(t.trim().to_lowercase(), i);
+            }
+        }
+    }
+
+    // 读取原四个字段的现有标签
+    let current: Vec<Vec<String>> = layout
+        .bucket_paths
+        .iter()
+        .map(|path| match json_get_path(data, path) {
+            Some(serde_json::Value::String(s)) => s
+                .split(',')
+                .map(|t| t.trim().to_string())
+                .filter(|t| !t.is_empty())
+                .collect(),
+            Some(serde_json::Value::Array(arr)) => arr
+                .iter()
+                .filter_map(|v| v.as_str())
+                .map(|t| t.trim().to_string())
+                .filter(|t| !t.is_empty())
+                .collect(),
+            _ => Vec::new(),
+        })
+        .collect();
+
+    // 按归属重新分配；LLM 没提到的标签留在原字段
+    let mut next: Vec<Vec<String>> = vec![Vec::new(); layout.bucket_paths.len()];
+    for (origin, tags) in current.iter().enumerate() {
+        for t in tags {
+            let target = assign
+                .get(&t.to_lowercase())
+                .copied()
+                .filter(|i| *i < next.len())
+                .unwrap_or(origin);
+            if !next[target].iter().any(|x| x.eq_ignore_ascii_case(t)) {
+                next[target].push(t.clone());
+            }
+        }
+    }
+
+    for (i, path) in layout.bucket_paths.iter().enumerate() {
+        let value = if path_is_string_field(layout, path) {
+            serde_json::Value::String(next[i].join(", "))
+        } else {
+            serde_json::Value::Array(
+                next[i]
+                    .iter()
+                    .map(|t| serde_json::Value::String(t.clone()))
+                    .collect(),
+            )
+        };
+        json_set_path(data, path, value);
+    }
+}
+
 /// txt 内容强制以触发词开头（标签列表和自然语言描述一视同仁）。
 /// 幂等：LLM 自己已经按提示词带上了就不重复插入。
 fn ensure_trigger_prefix(content: &str, trigger: &str) -> String {
@@ -1112,38 +1187,47 @@ async fn process_single_file(
         }) => {
             let elapsed_ms = start.elapsed().as_millis();
             let original_count = original_tags.len();
-            let refined_count = refined_tags.len();
+            // 保集合模式下写盘的标签就是原有那批，LLM 回复里的增删不会生效
+            let preserving = is_json && options.preserve_tags;
+            let refined_count = if preserving {
+                original_count
+            } else {
+                refined_tags.len()
+            };
             let nl_written = is_json && nl.is_some();
             // 字段归属可能变了而标签集合没变（例如 simple background 从 tags 挪到 environment），
             // 这种情况也算改动，否则日志会误报"未变化"
             let rebucketed = is_json && buckets.has_field_assignment();
-            let changed = refined_tags != original_tags || nl_written || rebucketed;
+            let changed = (!preserving && refined_tags != original_tags) || nl_written || rebucketed;
             let mut warnings: Vec<String> = Vec::new();
 
-            // 对比分析
-            let orig_set: HashSet<&str> = original_tags.iter().map(|s| s.as_str()).collect();
-            let refine_set: HashSet<&str> = refined_tags.iter().map(|s| s.as_str()).collect();
+            // 增删对比。保集合模式跳过：标签实际没动，
+            // 报"移除/新增"会误导，还会把整批图复制进 Warn/
+            if !preserving {
+                let orig_set: HashSet<&str> = original_tags.iter().map(|s| s.as_str()).collect();
+                let refine_set: HashSet<&str> = refined_tags.iter().map(|s| s.as_str()).collect();
 
-            let removed: Vec<&str> = orig_set.difference(&refine_set).copied().collect();
-            let added: Vec<&str> = refine_set.difference(&orig_set).copied().collect();
+                let removed: Vec<&str> = orig_set.difference(&refine_set).copied().collect();
+                let added: Vec<&str> = refine_set.difference(&orig_set).copied().collect();
 
-            if !removed.is_empty() {
-                let display: Vec<&str> = removed.iter().take(5).copied().collect();
-                let suffix = if removed.len() > 5 {
-                    format!("等{}个", removed.len())
-                } else {
-                    String::new()
-                };
-                warnings.push(format!("移除: {}{}", display.join(", "), suffix));
-            }
-            if !added.is_empty() {
-                let display: Vec<&str> = added.iter().take(5).copied().collect();
-                let suffix = if added.len() > 5 {
-                    format!("等{}个", added.len())
-                } else {
-                    String::new()
-                };
-                warnings.push(format!("新增: {}{}", display.join(", "), suffix));
+                if !removed.is_empty() {
+                    let display: Vec<&str> = removed.iter().take(5).copied().collect();
+                    let suffix = if removed.len() > 5 {
+                        format!("等{}个", removed.len())
+                    } else {
+                        String::new()
+                    };
+                    warnings.push(format!("移除: {}{}", display.join(", "), suffix));
+                }
+                if !added.is_empty() {
+                    let display: Vec<&str> = added.iter().take(5).copied().collect();
+                    let suffix = if added.len() > 5 {
+                        format!("等{}个", added.len())
+                    } else {
+                        String::new()
+                    };
+                    warnings.push(format!("新增: {}{}", display.join(", "), suffix));
+                }
             }
 
             let output_name = format!("{}.{}", stem, tag_ext);
@@ -1163,7 +1247,10 @@ async fn process_single_file(
                 }
             };
             let output_content = if let Some(mut data) = json_data {
-                if buckets.has_field_assignment() {
+                if options.preserve_tags {
+                    // 只归类不增删：标签集合恒定，LLM 的回复只当作归属映射
+                    apply_buckets_preserving(&mut data, &buckets);
+                } else if buckets.has_field_assignment() {
                     // LLM 给了字段归属：重排 count/appearance/environment/tags
                     // （本地打标器靠关键词表分类，"simple background" 之类常落错格）
                     apply_buckets_to_json(&mut data, &buckets, &refined_tags);
@@ -1558,6 +1645,58 @@ mod marker_tests {
         assert!(parse_refine_response("Sorry, I cannot help.", &[]).is_err());
         // 普通单行仍按标签处理
         assert!(parse_refine_response("1girl, solo", &[]).is_ok());
+    }
+
+    /// 保集合归类：LLM 的增删一概不生效，只有归属被采纳
+    #[test]
+    fn preserving_rebucket_never_changes_the_tag_set() {
+        let mut data = serde_json::json!({
+            "fixed": {"quality": "masterpiece", "series": "", "artist": ""},
+            "character": {"name": "hatsune miku", "variant": ""},
+            "from_path": {"appearance": ["twintails"]},
+            "ai_output": {
+                "count": "1girl",
+                "appearance": ["long hair", "smile"],
+                "tags": ["simple background"],
+                "environment": [],
+                "nl": ""
+            }
+        });
+        // LLM：把 simple background 挪到 environment、smile 挪到 tags（正确的归类），
+        // 但同时私自删掉 long hair、新增 blush
+        let buckets = TagBuckets {
+            count: Some(vec!["1girl".into()]),
+            appearance: Some(vec![]),
+            tags: Some(vec!["smile".into(), "blush".into()]),
+            environment: Some(vec!["simple background".into()]),
+        };
+        apply_buckets_preserving(&mut data, &buckets);
+
+        // 归属被采纳
+        assert_eq!(
+            data["ai_output"]["environment"],
+            serde_json::json!(["simple background"])
+        );
+        assert_eq!(data["ai_output"]["tags"], serde_json::json!(["smile"]));
+        assert_eq!(data["ai_output"]["count"], "1girl");
+        // LLM 私自新增的 blush 被丢弃
+        assert!(!data["ai_output"]["tags"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|v| v == "blush"));
+        // LLM 漏掉的 long hair 留在原字段，没有丢失
+        assert_eq!(
+            data["ai_output"]["appearance"],
+            serde_json::json!(["long hair"])
+        );
+        // 非重排字段一概不碰
+        assert_eq!(data["character"]["name"], "hatsune miku");
+        assert_eq!(data["fixed"]["quality"], "masterpiece");
+        assert_eq!(
+            data["from_path"]["appearance"],
+            serde_json::json!(["twintails"])
+        );
     }
 
     /// 触发词：txt 强制置于开头，且不能重复插入（caption 提示词也会要求 LLM 自己带上）

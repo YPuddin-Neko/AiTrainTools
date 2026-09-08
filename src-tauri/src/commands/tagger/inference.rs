@@ -80,6 +80,17 @@ pub fn is_tagging_cancelled() -> bool {
     TAGGING_CANCELLED.load(Ordering::SeqCst)
 }
 
+/// 把子进程句柄登记到全局，让 cancel_tagging / kill_python_process 能终止它。
+/// 转换模式也必须登记，否则取消时杀不到那个进程。
+pub(crate) fn register_python_process(child: Child) {
+    *PYTHON_PROCESS.lock().unwrap_or_else(|e| e.into_inner()) = Some(child);
+}
+
+/// 取出全局句柄（已被取消杀掉时为 None），供调用方 wait 回收
+pub(crate) fn take_python_process() -> Option<Child> {
+    PYTHON_PROCESS.lock().ok().and_then(|mut g| g.take())
+}
+
 /// 杀死正在运行的 Python 推理进程
 pub fn kill_python_process() {
     // 按进程树终止：Python 会派生工作进程，单杀直接子进程会留下孤儿进程
