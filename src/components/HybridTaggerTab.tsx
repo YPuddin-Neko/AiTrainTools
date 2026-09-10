@@ -147,11 +147,16 @@ The tags state WHAT is present. Your own observation must supply WHAT IT LOOKS L
 
 So treat every tag as an established fact, then quantify and situate it with what you see. Never just restate the tag list as sentences.
 
+MULTIPLE FIGURES (read this before writing):
+When more than one figure is present, describe the picture as ONE interaction, never one figure after another. Do not finish everything about the first figure and only then start on the second — that produces two separate portraits instead of a scene. Anchor the description to what the figures are doing to each other and where their bodies meet, and weave each figure's own hair, face, clothing and exposure into that shared action at the moment it becomes relevant. Every figure present must get real detail; none may be reduced to a passing mention at the end.
+
 OUTPUT FORMAT (strict):
 - English only, segments separated by English commas
 - Length strictly 500-600 English words — this is critical, anything beyond gets truncated during training
 - Must begin with: {trigger},
-- Natural language description, NOT a tag list: every comma-separated segment must be a natural language phrase or descriptive clause, never isolated stacked keywords
+- Natural language description, NOT a tag list: every comma-separated segment must be a phrase or clause carrying a verb, a spatial relation or a state — never a bare noun sitting on its own
+  Wrong: "long sleeves, white gloves, a frilled headdress, a red ribbon, a bow, a collar"
+  Right: "long sleeves reach past her wrists into white gloves, a frilled headdress sits over her bangs, a red ribbon is knotted at her throat above a narrow collar"
 - Useful training keywords are welcome but must be embedded inside natural language
 - Spaces between words, never underscores: write "long hair", not "long_hair"
 - No Chinese punctuation, no periods joining content, everything joined by commas, with exactly ONE period at the very end
