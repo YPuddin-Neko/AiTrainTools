@@ -490,10 +490,13 @@ def run_convert_mode():
 
     exts = {".png", ".jpg", ".jpeg", ".webp", ".bmp", ".tiff", ".tif", ".gif"}
     root = Path(args.input)
-    if not root.is_dir():
-        result({"type": "error", "message": f"输入目录不存在: {args.input}"})
+    # 输入允许是单张图片：各页的输入选择器都支持"文件夹 / 单张图片"两种
+    if root.is_file():
+        images = [root] if root.suffix.lower() in exts else []
+    elif not root.is_dir():
+        result({"type": "error", "message": f"输入路径不存在: {args.input}"})
         return
-    if args.recursive:
+    elif args.recursive:
         images = sorted(f for f in root.rglob("*") if f.is_file() and f.suffix.lower() in exts)
     else:
         images = sorted(f for f in root.iterdir() if f.is_file() and f.suffix.lower() in exts)
